@@ -29,14 +29,13 @@ export function matchExtension(url: string, extensions: WebFetchExtension[]): We
 }
 
 /**
- * Holds extensions from three sources in priority order:
- * event-bus (Pi extensions) → local → built-in.
+ * Holds extensions from two sources in priority order:
+ * event-bus (Pi extensions) → local.
  * The match() method searches in this priority order, returning the first match.
  */
 export class ExtensionRegistry {
 	private eventBus: WebFetchExtension[] = [];
 	private local: WebFetchExtension[] = [];
-	private builtIn: WebFetchExtension[] = [];
 
 	addEventBus(ext: WebFetchExtension): void {
 		this.eventBus.push(ext);
@@ -46,33 +45,27 @@ export class ExtensionRegistry {
 		this.local.push(ext);
 	}
 
-	addBuiltIn(ext: WebFetchExtension): void {
-		this.builtIn.push(ext);
-	}
-
 	/**
 	 * Find the first extension matching the given URL.
-	 * Searches in priority order: event-bus → local → built-in.
+	 * Searches in priority order: event-bus → local.
 	 */
 	match(url: string): WebFetchExtension | null {
 		return (
 			matchExtension(url, this.eventBus) ||
-			matchExtension(url, this.local) ||
-			matchExtension(url, this.builtIn)
+			matchExtension(url, this.local)
 		);
 	}
 
 	/** Total number of registered extensions across all sources. */
 	get count(): number {
-		return this.eventBus.length + this.local.length + this.builtIn.length;
+		return this.eventBus.length + this.local.length;
 	}
 
 	/** Counts per source for logging. */
-	get counts(): { eventBus: number; local: number; builtIn: number } {
+	get counts(): { eventBus: number; local: number } {
 		return {
 			eventBus: this.eventBus.length,
 			local: this.local.length,
-			builtIn: this.builtIn.length,
 		};
 	}
 }

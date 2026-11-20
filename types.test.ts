@@ -10,14 +10,9 @@ describe("createHookContext", () => {
 		expect(ctx.parsedUrl.pathname).toBe("/page");
 	});
 
-	it("includes prompt when provided", () => {
-		const ctx = createHookContext("https://example.com", { prompt: "What is this?" });
-		expect(ctx.prompt).toBe("What is this?");
-	});
-
-	it("prompt is undefined when not provided", () => {
+	it("does not expose LLM prompt state", () => {
 		const ctx = createHookContext("https://example.com");
-		expect(ctx.prompt).toBeUndefined();
+		expect("prompt" in ctx).toBe(false);
 	});
 
 	it("includes signal when provided", () => {
@@ -35,28 +30,9 @@ describe("createHookContext", () => {
 	});
 });
 
-describe("redirect helper", () => {
-	it("returns a HookResult with text content", () => {
+describe("hook context helpers", () => {
+	it("does not include the removed redirect helper", () => {
 		const ctx = createHookContext("https://example.com");
-		const result = ctx.redirect("Use a different tool");
-
-		expect(result).toEqual({
-			content: [{ type: "text", text: "Use a different tool" }],
-		});
-	});
-
-	it("returns content that can be used as a tool response", () => {
-		const ctx = createHookContext("https://example.com");
-		const result = ctx.redirect("Clone the repo: git clone https://github.com/org/repo");
-
-		expect(result.content).toHaveLength(1);
-		expect(result.content[0].type).toBe("text");
-		expect((result.content[0] as { type: "text"; text: string }).text).toContain("git clone");
-	});
-
-	it("does not set isError", () => {
-		const ctx = createHookContext("https://example.com");
-		const result = ctx.redirect("Some message");
-		expect(result.isError).toBeUndefined();
+		expect("redirect" in ctx).toBe(false);
 	});
 });

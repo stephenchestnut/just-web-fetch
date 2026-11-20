@@ -13,6 +13,7 @@
  *   - shutdown() immediately closes everything
  */
 import puppeteer, { type Browser, type Page } from "puppeteer";
+import { findBrowserExecutable } from "./browser-path.js";
 
 export interface BrowserPoolOptions {
 	/** Maximum concurrent tabs. Excess requests queue until a tab is available. Default: 6. */
@@ -128,9 +129,12 @@ export class BrowserPool {
 		// Deduplicate concurrent launches
 		if (this.launching) return this.launching;
 
+		const executable = findBrowserExecutable({ puppeteerPath: () => puppeteer.executablePath() });
+		if (!executable.ok) throw new Error(executable.error);
+
 		this.launching = puppeteer.launch({
 			headless: true,
-			executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+			executablePath: executable.path,
 		});
 
 		try {

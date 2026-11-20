@@ -1,28 +1,38 @@
 {
-  "name": "pi-web-fetch",
-  "version": "1.1.0",
-  "description": "Pi extension: fetch web pages via headless Chrome, extract content with trafilatura, and optionally process with an LLM",
+  "name": "just-web-fetch",
+  "version": "2.0.0",
+  "description": "Pi extension: fetch web pages via headless Chrome and extract readable Markdown with trafilatura, without LLM summarization",
   "type": "module",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-extension",
+    "web-fetch",
+    "puppeteer",
+    "trafilatura"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/georgebashi/pi-web-fetch"
+    "url": "git+https://github.com/stephenchestnut/just-web-fetch.git"
   },
-  "author": "georgebashi",
+  "author": "stephenchestnut",
   "license": "MIT",
   "files": [
     "index.ts",
     "types.ts",
     "registry.ts",
     "browser-pool.ts",
-    "extensions/",
-    "README.md"
+    "browser-path.ts",
+    "fetch-page.ts",
+    "network-policy.ts",
+    "outcome.ts",
+    "result.ts",
+    "storage.ts",
+    "README.md",
+    "LICENSE"
   ],
   "exports": {
     ".": "./index.ts",
@@ -45,5 +55,12 @@
   "devDependencies": {
     "@types/picomatch": "^4.0.2",
     "vitest": "^4.0.18"
-  }
+  },
+  "homepage": "https://github.com/stephenchestnut/just-web-fetch#readme",
+  "bugs": {
+    "url": "https://github.com/stephenchestnut/just-web-fetch/issues"
+  },
+  "contributors": [
+    "georgebashi (original pi-web-fetch author)"
+  ]
 }

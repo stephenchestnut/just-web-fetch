@@ -4,10 +4,14 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { truncateHead, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
+import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Text, Markdown, Container } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { BrowserPool } from "./browser-pool.js";
+import { fetchPage, PAGE_TIMEOUT_MS, type FetchedPage } from "./fetch-page.js";
+import type { ExtractedPage } from "./result.js";
+import { buildToolResult, STRUCTURED_RESULT_SCHEMA, type PageOutcome } from "./outcome.js";
+import { cleanupSessionDirectories, DEFAULT_RETENTION_DAYS, EPHEMERAL_RETENTION_DAYS, FetchStore } from "./storage.js";
 
 // Re-export public types for extension authors
 export type {
@@ -16,7 +20,6 @@ export type {
 	HookResult,
 	AfterFetchHookContext,
 	AfterExtractHookContext,
-	SummarizeHookContext,
 	ToolContent,
 } from "./types.js";
 
@@ -26,7 +29,6 @@ import type {
 	HookResult,
 	AfterFetchHookContext,
 	AfterExtractHookContext,
-	SummarizeHookContext,
 } from "./types.js";
 import { createHookContext } from "./types.js";
 import { ExtensionRegistry } from "./registry.js";
@@ -34,15 +36,22 @@ import { ExtensionRegistry } from "./registry.js";
 // --- Config ---
 
 interface WebFetchConfig {
-	/** Model for LLM processing (e.g. "provider/model-id"). Defaults to the current session model. */
-	model?: string;
-	/** Thinking level for the sub-agent. Defaults to the current session thinking level. */
-	thinkingLevel?: string;
-	/** Custom directory path for local extensions. Defaults to ~/.pi/extensions/web-fetch/ */
+	/** Directory for local extensions. Defaults to <agent-dir>/just-web-fetch/extensions/ */
 	extensionsDir?: string;
+	/** Delete saved session directories unused for this many days. Defaults to 30; 0 disables cleanup. */
+	retentionDays?: number;
 }
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "web-fetch.json");
+const AGENT_DIR = getAgentDir();
+const DATA_DIR = join(AGENT_DIR, "just-web-fetch");
+const CONFIG_PATH = join(AGENT_DIR, "just-web-fetch.json");
+const SESSIONS_DIR = join(DATA_DIR, "sessions");
+const EPHEMERAL_DIR = join(DATA_DIR, "ephemeral");
+
+/** Expand a leading ~ in a configured path. */
+function expandHome(path: string): string {
+	return path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+}
 
 function loadConfig(): WebFetchConfig {
 	try {
@@ -63,42 +72,6 @@ const browserPool = new BrowserPool({ maxTabs: MAX_BROWSER_TABS, idleTimeoutMs: 
 // --- Extension Loading ---
 
 type NotifyFn = (message: string, level: "info" | "warning" | "error") => void;
-
-/**
- * Load built-in extensions from the extensions/ directory relative to this file.
- */
-async function loadBuiltInExtensions(notify: NotifyFn): Promise<void> {
-	const thisDir = dirname(fileURLToPath(import.meta.url));
-	const extensionsDir = join(thisDir, "extensions");
-
-	if (!existsSync(extensionsDir)) {
-		return;
-	}
-
-	const files = readdirSync(extensionsDir).filter(
-		(f) => f.endsWith(".ts") || f.endsWith(".js"),
-	);
-
-	for (const file of files) {
-		try {
-			const modulePath = join(extensionsDir, file);
-			const mod = await import(modulePath);
-			const factory = mod.default;
-			if (typeof factory !== "function") {
-				notify(`web-fetch: built-in extension ${file} has no default export function, skipping`, "warning");
-				continue;
-			}
-			const ext: WebFetchExtension = factory();
-			if (!ext.name || !ext.matches) {
-				notify(`web-fetch: built-in extension ${file} missing name or matches, skipping`, "warning");
-				continue;
-			}
-			registry.addBuiltIn(ext);
-		} catch (err: any) {
-			notify(`web-fetch: failed to load built-in extension ${file}: ${err.message}`, "error");
-		}
-	}
-}
 
 /**
  * Load local extensions from a user directory.
@@ -156,15 +129,12 @@ function setupEventBusRegistration(pi: ExtensionAPI): void {
 
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const CACHE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const PAGE_TIMEOUT_MS = 10_000; // 10 seconds
 const EXTRACT_TIMEOUT_MS = 10_000; // 10 seconds for trafilatura extraction
-const SUBAGENT_TIMEOUT_MS = 10_000; // 10 seconds for LLM sub-agent processing
-const CONTENT_SIZE_THRESHOLD = 50_000; // ~50KB — above this, summarize instead of returning raw
 export const MAX_BATCH_SIZE = 10; // Maximum pages in a single batch call
 
 // --- Batch Status Types ---
 
-type BatchPageStatus = "pending" | "fetching" | "extracting" | "summarizing" | "done" | "error";
+type BatchPageStatus = "pending" | "fetching" | "extracting" | "done" | "error";
 
 interface BatchPageState {
 	url: string;
@@ -176,39 +146,27 @@ interface BatchDetails {
 	pages: BatchPageState[];
 }
 
-const CONTENT_GUARDRAILS = `Respond concisely using only the page content above.
-- Keep direct quotes under 125 characters and always use quotation marks for exact wording.
-- Outside of quotes, rephrase in your own words — never reproduce source text verbatim.
-- Open-source code and documentation snippets are fine to include as-is.`;
-
-const SUMMARIZE_PROMPT = `Summarize this page:
-1. A 2-3 sentence overview of the page's purpose.
-2. For each major section or heading, its name and a 1-2 sentence description.
-3. End with: "To extract specific information, call web_fetch again with the same URL and a prompt. The page is cached so re-fetching is instant."
-
-${CONTENT_GUARDRAILS}`;
-
 // --- Cache ---
 
 interface CacheEntry {
-	content: string;
+	page: ExtractedPage;
 	timestamp: number;
 }
 
 const cache = new Map<string, CacheEntry>();
 
-function getCached(url: string): string | null {
+function getCached(url: string): ExtractedPage | null {
 	const entry = cache.get(url);
 	if (!entry) return null;
 	if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
 		cache.delete(url);
 		return null;
 	}
-	return entry.content;
+	return entry.page;
 }
 
-function setCache(url: string, content: string): void {
-	cache.set(url, { content, timestamp: Date.now() });
+function setCache(url: string, page: ExtractedPage): void {
+	cache.set(url, { page, timestamp: Date.now() });
 }
 
 function cleanupCache(): void {
@@ -353,83 +311,6 @@ async function detectPythonRunner(execFn: ExtensionAPI["exec"]): Promise<PythonR
 	return null;
 }
 
-// --- Page Fetching ---
-
-interface FetchResult {
-	html: string;
-	finalUrl: string;
-}
-
-interface RedirectResult {
-	redirectedTo: string;
-}
-
-async function fetchPage(
-	url: string,
-	signal?: AbortSignal,
-): Promise<{ ok: true; result: FetchResult } | { ok: true; redirect: RedirectResult } | { ok: false; error: string }> {
-	let page: Awaited<ReturnType<typeof browserPool.acquire>> | null = null;
-
-	try {
-		if (signal?.aborted) return { ok: false, error: "Aborted" };
-
-		page = await browserPool.acquire(signal);
-
-		// Track redirects
-		const requestUrl = new URL(url);
-		let crossHostRedirect: string | null = null;
-
-		page.on("response", (response) => {
-			// Only track redirects for the main navigation request, not sub-resources
-			// (scripts, images, analytics, etc. often redirect cross-host)
-			if (!response.request().isNavigationRequest()) return;
-
-			const status = response.status();
-			if (status >= 300 && status < 400) {
-				const location = response.headers()["location"];
-				if (location) {
-					try {
-						const redirectUrl = new URL(location, url);
-						if (redirectUrl.hostname !== requestUrl.hostname) {
-							crossHostRedirect = redirectUrl.toString();
-						}
-					} catch {
-						// ignore malformed redirect URLs
-					}
-				}
-			}
-		});
-
-		try {
-			await page.goto(url, {
-				waitUntil: "networkidle2",
-				timeout: PAGE_TIMEOUT_MS,
-			});
-		} catch (err: any) {
-			if (signal?.aborted) return { ok: false, error: "Aborted" };
-			if (err.name === "TimeoutError" || err.message?.includes("timeout")) {
-				return { ok: false, error: `Page load timed out after ${PAGE_TIMEOUT_MS / 1000} seconds for URL: ${url}` };
-			}
-			return { ok: false, error: `Failed to load page: ${err.message}` };
-		}
-
-		// Check for cross-host redirect
-		if (crossHostRedirect) {
-			return { ok: true, redirect: { redirectedTo: crossHostRedirect } };
-		}
-
-		const html = await page.content();
-		const finalUrl = page.url();
-
-		return { ok: true, result: { html, finalUrl } };
-	} catch (err: any) {
-		if (signal?.aborted) return { ok: false, error: "Aborted" };
-		return { ok: false, error: `Browser error: ${err.message}` };
-	} finally {
-		if (page) await browserPool.release(page);
-	}
-}
-
 // --- Content Extraction ---
 
 async function extractContent(
@@ -496,155 +377,8 @@ async function extractContent(
 	});
 }
 
-// --- Sub-Agent ---
-
-interface SubAgentResult {
-	ok: true;
-	response: string;
-}
-
-interface SubAgentError {
-	ok: false;
-	error: string;
-}
-
-async function runSubAgent(
-	content: string,
-	prompt: string,
-	model: string,
-	thinkingLevel: string,
-	signal?: AbortSignal,
-): Promise<SubAgentResult | SubAgentError> {
-	if (signal?.aborted) return { ok: false, error: "Aborted" };
-
-	const fullPrompt = `Web page content:\n---\n${content}\n---\n\n${prompt}`;
-
-	return new Promise((resolve) => {
-		const proc = spawn("pi", [
-			"--mode", "json",
-			"-p",
-			"--no-session",
-			"--no-tools",
-			"--model", model,
-			"--thinking", thinkingLevel,
-			fullPrompt,
-		], {
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-
-		let buffer = "";
-		let lastAssistantText = "";
-		let stderr = "";
-
-		const onAbort = () => killProcess(proc);
-		signal?.addEventListener("abort", onAbort, { once: true });
-
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			try {
-				const event = JSON.parse(line);
-				if (event.type === "message_end" && event.message?.role === "assistant") {
-					for (const part of event.message.content) {
-						if (part.type === "text") {
-							lastAssistantText = part.text;
-						}
-					}
-				}
-			} catch {
-				// ignore non-JSON lines
-			}
-		};
-
-		proc.stdout.on("data", (data) => {
-			buffer += data.toString();
-			const lines = buffer.split("\n");
-			buffer = lines.pop() || "";
-			for (const line of lines) processLine(line);
-		});
-
-		proc.stderr.on("data", (data) => {
-			stderr += data.toString();
-		});
-
-		proc.on("close", (code) => {
-			signal?.removeEventListener("abort", onAbort);
-
-			// Process any remaining buffer
-			if (buffer.trim()) processLine(buffer);
-
-			if (signal?.aborted) {
-				resolve({ ok: false, error: "Aborted" });
-				return;
-			}
-
-			if (lastAssistantText) {
-				resolve({ ok: true, response: lastAssistantText });
-			} else if (code !== 0) {
-				resolve({ ok: false, error: `Sub-agent failed (exit code ${code}): ${stderr.trim() || "(no output)"}` });
-			} else {
-				resolve({ ok: false, error: "Sub-agent returned no response" });
-			}
-		});
-
-		proc.on("error", (err) => {
-			signal?.removeEventListener("abort", onAbort);
-			resolve({ ok: false, error: `Failed to spawn pi sub-agent: ${err.message}` });
-		});
-	});
-}
-
-// --- Batch Result Formatting ---
-
-/**
- * Format batch results into a single text content block with per-page headers.
- * Exported for testing.
- */
-export function formatBatchResults(
-	pages: Array<{ url: string; prompt?: string }>,
-	results: PromiseSettledResult<any>[],
-) {
-	const total = pages.length;
-
-	// Single page: return the result directly without batch header wrapper
-	if (total === 1) {
-		const settled = results[0];
-		if (settled.status === "rejected") {
-			return {
-				content: [{ type: "text", text: `Error: ${settled.reason?.message || String(settled.reason)}` }],
-				isError: true,
-			};
-		}
-		return settled.value;
-	}
-
-	const sections: string[] = [];
-
-	for (let i = 0; i < total; i++) {
-		const header = `--- [${i + 1}/${total}] ${pages[i].url} ---`;
-		const settled = results[i];
-
-		let body: string;
-		if (settled.status === "rejected") {
-			body = `Error: ${settled.reason?.message || String(settled.reason)}`;
-		} else {
-			const result = settled.value;
-			if (result.isError) {
-				const textContent = result.content?.[0];
-				body = `Error: ${textContent?.type === "text" ? textContent.text : "Unknown error"}`;
-			} else {
-				const textContent = result.content?.[0];
-				body = textContent?.type === "text" ? textContent.text : "(no content)";
-			}
-		}
-
-		sections.push(`${header}\n${body}`);
-	}
-
-	return {
-		content: [{ type: "text", text: sections.join("\n\n") }],
-	};
-}
-
+// Exported for tests and existing imports.
+export { formatBatchResults } from "./outcome.js";
 
 // --- Batch Status Rendering ---
 
@@ -652,7 +386,6 @@ const STATUS_ICONS: Record<BatchPageStatus, string> = {
 	pending: "○",
 	fetching: "◐",
 	extracting: "◑",
-	summarizing: "◕",
 	done: "●",
 	error: "✗",
 };
@@ -661,7 +394,6 @@ const STATUS_LABELS: Record<BatchPageStatus, string> = {
 	pending: "waiting",
 	fetching: "fetching",
 	extracting: "extracting",
-	summarizing: "summarizing",
 	done: "done",
 	error: "error",
 };
@@ -703,6 +435,8 @@ function renderBatchStatus(pages: BatchPageState[], theme: any): Container {
 
 export default function (pi: ExtensionAPI) {
 	let cleanupInterval: ReturnType<typeof setInterval> | null = null;
+	let store: FetchStore | null = null;
+	let storeError: string | null = null;
 
 	// Dependency check and extension loading on session start
 	pi.on("session_start", async (_event, ctx) => {
@@ -717,12 +451,26 @@ export default function (pi: ExtensionAPI) {
 		// 1. Subscribe to event bus registrations (persistent for session lifetime)
 		setupEventBusRegistration(pi);
 
-		// 2. Load built-in extensions
-		await loadBuiltInExtensions(ctx.ui.notify.bind(ctx.ui));
-
-		// 3. Load local extensions
-		const localDir = config.extensionsDir || join(homedir(), ".pi", "extensions", "web-fetch");
+		// 2. Load local extensions
+		const localDir = config.extensionsDir ? expandHome(config.extensionsDir) : join(DATA_DIR, "extensions");
 		await loadLocalExtensions(localDir, ctx.ui.notify.bind(ctx.ui));
+
+		// 3. Open storage for complete extractions and remove stale session directories
+		try {
+			store = await FetchStore.open({
+				sessionsRoot: SESSIONS_DIR,
+				ephemeralRoot: EPHEMERAL_DIR,
+				sessionId: ctx.sessionManager.getSessionId(),
+				persisted: ctx.sessionManager.getSessionFile() !== undefined,
+			});
+			storeError = null;
+			const retentionDays = config.retentionDays ?? DEFAULT_RETENTION_DAYS;
+			await cleanupSessionDirectories(SESSIONS_DIR, { retentionDays, keep: store.directory });
+			await cleanupSessionDirectories(EPHEMERAL_DIR, { retentionDays: EPHEMERAL_RETENTION_DAYS, keep: store.directory });
+		} catch (err: any) {
+			storeError = `could not prepare storage: ${err?.message || String(err)}`;
+			ctx.ui.notify(`web_fetch: ${storeError}`, "warning");
+		}
 
 		// 4. Signal readiness to other Pi extensions
 		pi.events.emit("web-fetch:ready", undefined);
@@ -732,62 +480,65 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Clean up on shutdown
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
 		if (cleanupInterval) {
 			clearInterval(cleanupInterval);
 			cleanupInterval = null;
 		}
 		cache.clear();
 		await browserPool.shutdown();
+		try {
+			// `reason` is available in current Pi; older versions omit it, so ephemeral files are removed.
+			await store?.close((event as { reason?: string } | undefined)?.reason);
+		} catch {
+			// Best-effort cleanup; stale ephemeral directories are removed on a later start.
+		}
+		store = null;
 	});
 
-	// Register the web_fetch tool
+	// Register the web_fetch tool.
+	// `outputSchema` and `structuredContent` are supported by current Pi (codemode scripts receive the
+	// structured value) but missing from older type definitions. Older Pi ignores them.
 	pi.registerTool({
 		name: "web_fetch",
 		label: "Web Fetch",
 		description: [
-			"Retrieves and extracts the main content of a web page as markdown.",
+			"Retrieves a web page in headless Chrome and extracts its main content as Markdown.",
+			"It never summarizes or answers questions about the page; analyze the returned content yourself.",
 			"",
-			"Include a 'prompt' parameter to have an LLM distill the page down to just the information you need \u2014 this saves significant context compared to ingesting raw page content.",
-			"Without a prompt, the full extracted markdown is returned (or a structured overview if the page is large).",
-			"",
-			"Batch mode: use 'pages' instead of 'url' to fetch multiple URLs in a single call. Each entry can have its own prompt.",
-			"This is much faster than making separate web_fetch calls when you need content from several pages.",
+			"Batch mode: use 'pages' instead of 'url' to fetch multiple URLs in a single call.",
 			"The 'url' and 'pages' parameters are mutually exclusive. Maximum 10 pages per batch.",
 			"",
-			"When to use something else:",
-			"- The gh CLI (via bash) for anything on GitHub \u2014 issues, PRs, repo contents, API calls.",
+			"Output:",
+			"- Each result starts with source metadata: final URL, requested URL and redirects when they differ, and the path of the saved Markdown file.",
+			"- The complete extraction is always saved to that file. When it is too large to return inline, the result is a clearly marked PREVIEW ONLY; use read or grep on the saved file for the rest.",
+			"- From codemode, the call resolves to structured data, `{ pages: [...] }`, with one entry per requested URL in request order. Each entry has `status` (\"fetched\", \"error\" or \"extension\") and `requestedUrl`. Fetched entries include `finalUrl`, `redirectChain`, the complete `markdown` (never truncated), `savedPath`, `bytes`, `lines`, `blockedRequests` and `cached`. Errors include `error`. Failed pages do not throw, so check `status`.",
 			"",
 			"Behavior notes:",
-			"- URLs must include the scheme (e.g. https://). Plain HTTP is silently upgraded to HTTPS.",
-			"- Fetched content is held in a short-lived cache, so asking multiple questions about the same page is cheap.",
-			"- Cross-host redirects are surfaced rather than followed \u2014 make a second request to the target URL.",
-			"- No files or external state are modified by this tool.",
+			"- URLs must include the scheme (e.g. https://). Plain HTTP is upgraded to HTTPS.",
+			"- Redirects are followed automatically. Redirects from HTTPS to HTTP are rejected.",
+			"- Requests to localhost, private networks, link-local/cloud metadata and other special-purpose addresses are blocked. Use bash with curl for local services.",
+			"- Extracted content is held in a short-lived cache.",
 		].join("\n"),
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "Fully-formed URL to fetch (e.g., https://example.com/page). Mutually exclusive with 'pages'." })),
-			prompt: Type.Optional(
-				Type.String({
-					description:
-						"What information to extract from the page. Strongly recommended \u2014 the page content will be processed by a fast LLM and only relevant information returned. Omit only if you need the full raw content. Only used with 'url', not 'pages'.",
-				}),
-			),
 			pages: Type.Optional(
 				Type.Array(
 					Type.Object({
 						url: Type.String({ description: "Fully-formed URL to fetch" }),
-						prompt: Type.Optional(Type.String({ description: "What information to extract from this page" })),
 					}),
-					{ maxItems: MAX_BATCH_SIZE, description: `Array of pages to fetch concurrently (max ${MAX_BATCH_SIZE}). Mutually exclusive with 'url'. Each entry can have its own prompt.` },
+					{ maxItems: MAX_BATCH_SIZE, description: `Array of pages to fetch concurrently (max ${MAX_BATCH_SIZE}). Mutually exclusive with 'url'.` },
 				),
 			),
 		}),
+		...({
+			outputSchema: STRUCTURED_RESULT_SCHEMA,
+			promptGuidelines: [
+				"Use web_fetch from codemode to extract small facts from many pages: batch up to 10 URLs per call, read each entry's complete `markdown`, and return only the extracted values.",
+			],
+		} as {}),
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			// Resolve model and thinking level: config file → current session
-			const model = config.model || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
-			const thinkingLevel = config.thinkingLevel || pi.getThinkingLevel();
-
+		async execute(_toolCallId, params, signal, onUpdate) {
 			// --- Parameter validation ---
 			const hasUrl = params.url !== undefined && params.url !== null;
 			const hasPages = params.pages !== undefined && params.pages !== null;
@@ -822,11 +573,11 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// --- Batch mode ---
-				return await executeBatch(pages, model, thinkingLevel, signal, onUpdate);
+				return await executeBatch(pages, signal, onUpdate);
 			}
 
 			// --- Single URL mode — route through batch for unified status view ---
-			return await executeBatch([{ url: params.url!, prompt: params.prompt }], model, thinkingLevel, signal, onUpdate);
+			return await executeBatch([{ url: params.url! }], signal, onUpdate);
 		},
 
 		renderCall(args, theme) {
@@ -846,9 +597,6 @@ export default function (pi: ExtensionAPI) {
 			const url = args.url || "...";
 			const shortUrl = url.length > 70 ? url.slice(0, 70) + "..." : url;
 			let text = theme.fg("toolTitle", theme.bold("web_fetch ")) + theme.fg("accent", shortUrl);
-			if (args.prompt) {
-				text += "  " + theme.fg("dim", "\u00b7 " + args.prompt);
-			}
 			return new Text(text, 0, 0);
 		},
 
@@ -859,7 +607,7 @@ export default function (pi: ExtensionAPI) {
 				return renderBatchStatus(batchDetails.pages, theme);
 			}
 
-			const isError = result.isError;
+			const isError = (result as { isError?: boolean }).isError;
 			const textContent = result.content[0];
 			const text = textContent?.type === "text" ? textContent.text : "(no output)";
 
@@ -888,45 +636,39 @@ export default function (pi: ExtensionAPI) {
 	 */
 	async function processSingleUrl(
 		rawUrl: string,
-		prompt: string | undefined,
-		model: string | undefined,
-		thinkingLevel: string,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
-	) {
+	): Promise<PageOutcome> {
 		// 1. Validate and normalize URL
 		const urlResult = validateAndNormalizeUrl(rawUrl);
-		if (urlResult.error) {
-			return {
-				content: [{ type: "text", text: urlResult.error }],
-				isError: true,
-			};
+		if (urlResult.url === undefined) {
+			return { status: "error", error: urlResult.error };
 		}
 		const url = urlResult.url;
 
 		// Find matching extension (if any)
 		const matchedExtension = registry.match(url);
-		const hookCtx = createHookContext(url, { prompt, signal });
+		const hookCtx = createHookContext(url, { signal });
 
 		// 2. Check cache (before hooks, since beforeFetch may short-circuit)
 		const cached = getCached(url);
 		if (cached) {
-			onUpdate?.({ content: [{ type: "text", text: "Cache hit — processing..." }] });
-			return await runProcess(cached, url, prompt, model, thinkingLevel, matchedExtension, hookCtx, signal, onUpdate);
+			return { status: "fetched", page: cached, cached: true };
 		}
 
 		// 3. beforeFetch hook — can short-circuit entire pipeline
 		if (matchedExtension?.beforeFetch) {
 			const hookResult = await matchedExtension.beforeFetch(hookCtx);
 			if (hookResult) {
-				return hookResult;
+				return { status: "extension", url, extension: matchedExtension.name, result: hookResult };
 			}
 		}
 
 		// 4. Fetch page
 		const fetchOuter = await runFetch(url, signal, onUpdate);
 		if (fetchOuter.done) return fetchOuter.result;
-		let html = fetchOuter.html;
+		const fetched = fetchOuter.page;
+		let html = fetched.html;
 
 		// 5. afterFetch hook — can replace HTML or short-circuit
 		if (matchedExtension?.afterFetch) {
@@ -935,7 +677,7 @@ export default function (pi: ExtensionAPI) {
 			if (hookResult) {
 				if ("content" in hookResult && Array.isArray(hookResult.content)) {
 					// HookResult — short-circuit
-					return hookResult as HookResult;
+					return { status: "extension", url, extension: matchedExtension.name, result: hookResult as HookResult };
 				}
 				if ("html" in hookResult && typeof (hookResult as any).html === "string") {
 					// HTML replacement
@@ -959,16 +701,34 @@ export default function (pi: ExtensionAPI) {
 					markdown = hookResult;
 				} else if ("content" in hookResult && Array.isArray(hookResult.content)) {
 					// HookResult — short-circuit
-					return hookResult as HookResult;
+					return { status: "extension", url, extension: matchedExtension.name, result: hookResult as HookResult };
 				}
 			}
 		}
 
-		// 8. Store in cache
-		setCache(url, markdown);
+		// 8. Save the complete extraction
+		const page: ExtractedPage = {
+			requestedUrl: fetched.requestedUrl,
+			finalUrl: fetched.finalUrl,
+			redirectChain: fetched.redirectChain,
+			blockedRequests: fetched.blockedRequests,
+			markdown,
+		};
+		if (store) {
+			try {
+				page.savedPath = await store.save({ ...page, fetchedAt: new Date() });
+			} catch (err: any) {
+				page.saveError = `could not save extraction: ${err?.message || String(err)}`;
+			}
+		} else {
+			page.saveError = storeError ?? "storage is not available";
+		}
 
-		// 9. Process and return (with summarize hook support)
-		return await runProcess(markdown, url, prompt, model, thinkingLevel, matchedExtension, hookCtx, signal, onUpdate);
+		// 9. Cache only successfully saved pages, so cached results always include a valid file path
+		if (page.savedPath) setCache(url, page);
+
+		// 10. Return extracted content
+		return { status: "fetched", page, cached: false };
 	}
 
 	// --- Batch Execution ---
@@ -979,14 +739,10 @@ export default function (pi: ExtensionAPI) {
 	 * and formatted into a single text block with per-page headers.
 	 */
 	async function executeBatch(
-		pages: Array<{ url: string; prompt?: string }>,
-		model: string | undefined,
-		thinkingLevel: string,
+		pages: Array<{ url: string }>,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
 	) {
-		const total = pages.length;
-
 		// Track per-page status for UI
 		const pageStates: BatchPageState[] = pages.map((p) => ({
 			url: p.url,
@@ -1013,76 +769,52 @@ export default function (pi: ExtensionAPI) {
 						pageStates[i].status = "fetching";
 					} else if (msg.startsWith("Extracting")) {
 						pageStates[i].status = "extracting";
-					} else if (msg.startsWith("Processing") || msg.includes("summary") || msg.includes("Cache hit")) {
-						pageStates[i].status = "summarizing";
 					}
 				}
 				emitBatchUpdate();
 			};
 
-			const result = await processSingleUrl(page.url, page.prompt, model, thinkingLevel, signal, pageOnUpdate);
+			const outcome = await processSingleUrl(page.url, signal, pageOnUpdate);
 
-			// Mark done or error based on result
-			if (result.isError) {
+			// Mark done or error based on outcome
+			if (outcome.status === "error") {
 				pageStates[i].status = "error";
-				const errText = result.content?.[0];
-				if (errText?.type === "text") {
-					pageStates[i].error = errText.text;
-				}
+				pageStates[i].error = outcome.error;
+			} else if (outcome.status === "extension" && outcome.result.isError) {
+				pageStates[i].status = "error";
 			} else {
 				pageStates[i].status = "done";
 			}
 			emitBatchUpdate();
 
-			return result;
+			return outcome;
 		});
 
-		const results = await Promise.allSettled(promises);
+		const outcomes = await Promise.allSettled(promises);
 
-		// Format results into a single text block
-		return formatBatchResults(pages, results);
+		// Model-facing text plus structured content for programmatic callers
+		const result = buildToolResult(pages, outcomes);
+		return { ...result, details: undefined };
 	}
 	// --- Pipeline Stage Functions ---
 
 	/**
 	 * Stage: Fetch page via puppeteer.
-	 * Returns either a done result (error/redirect) or the HTML to continue processing.
+	 * Returns either a done result (error) or the fetched page to continue processing.
 	 */
 	async function runFetch(
 		url: string,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
-	): Promise<{ done: true; result: any } | { done: false; html: string }> {
-		onUpdate?.({ content: [{ type: "text", text: `Fetching ${url}...` }] });
+	): Promise<{ done: true; result: PageOutcome } | { done: false; page: FetchedPage }> {
+		onUpdate?.({ content: [{ type: "text", text: `Fetching ${url}...` }], details: undefined });
 
-		const fetchResult = await fetchPage(url, signal);
+		const fetchResult = await fetchPage(browserPool, url, { signal, timeoutMs: PAGE_TIMEOUT_MS });
 		if (!fetchResult.ok) {
-			return {
-				done: true,
-				result: {
-					content: [{ type: "text", text: (fetchResult as { ok: false; error: string }).error }],
-					isError: true,
-				},
-			};
+			return { done: true, result: { status: "error", error: fetchResult.error } };
 		}
 
-		// Handle cross-host redirect
-		if ("redirect" in fetchResult) {
-			const redirectUrl = (fetchResult as { ok: true; redirect: RedirectResult }).redirect.redirectedTo;
-			return {
-				done: true,
-				result: {
-					content: [
-						{
-							type: "text",
-							text: `The URL redirected to a different host: ${redirectUrl}\n\nTo fetch the content, make a new web_fetch call with this URL: ${redirectUrl}`,
-						},
-					],
-				},
-			};
-		}
-
-		return { done: false, html: fetchResult.result.html };
+		return { done: false, page: fetchResult.page };
 	}
 
 	/**
@@ -1093,119 +825,14 @@ export default function (pi: ExtensionAPI) {
 		html: string,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
-	): Promise<{ done: true; result: any } | { done: false; markdown: string }> {
-		onUpdate?.({ content: [{ type: "text", text: "Extracting content..." }] });
+	): Promise<{ done: true; result: PageOutcome } | { done: false; markdown: string }> {
+		onUpdate?.({ content: [{ type: "text", text: "Extracting content..." }], details: undefined });
 
 		const extractResult = await withTimeout(extractContent(html, signal), EXTRACT_TIMEOUT_MS, "Content extraction", signal).catch((err): { ok: false; error: string } => ({ ok: false, error: err.message }));
 		if (!extractResult.ok) {
-			return {
-				done: true,
-				result: {
-					content: [{ type: "text", text: (extractResult as { ok: false; error: string }).error }],
-					isError: true,
-				},
-			};
+			return { done: true, result: { status: "error", error: (extractResult as { ok: false; error: string }).error } };
 		}
 
 		return { done: false, markdown: extractResult.markdown };
-	}
-
-	/**
-	 * Stage: Process extracted content — summarize hook, sub-agent, or raw return.
-	 */
-	async function runProcess(
-		markdown: string,
-		url: string,
-		prompt: string | undefined,
-		model: string | undefined,
-		thinkingLevel: string,
-		matchedExtension: WebFetchExtension | null,
-		hookCtx: HookContext,
-		signal?: AbortSignal,
-		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
-	) {
-		// Check summarize hook before sub-agent
-		if (matchedExtension?.summarize) {
-			const summarizeCtx: SummarizeHookContext = { ...hookCtx, markdown };
-			const hookResult = await matchedExtension.summarize(summarizeCtx);
-			if (hookResult) {
-				return hookResult;
-			}
-		}
-
-		// Prompted path — use sub-agent if model available
-		if (prompt && model) {
-			onUpdate?.({ content: [{ type: "text", text: "Processing with LLM..." }] });
-
-			const agentResult = await withTimeout(runSubAgent(markdown, `${prompt}\n\n${CONTENT_GUARDRAILS}`, model, thinkingLevel, signal), SUBAGENT_TIMEOUT_MS, "LLM processing", signal).catch((err): SubAgentError => ({ ok: false, error: err.message }));
-			if (agentResult.ok) {
-				return {
-					content: [{ type: "text", text: agentResult.response }],
-				};
-			}
-
-			// Fallback: return raw markdown with truncation + error note
-			const truncation = truncateHead(markdown, {
-				maxLines: DEFAULT_MAX_LINES,
-				maxBytes: DEFAULT_MAX_BYTES,
-			});
-
-			let fallbackText = truncation.content;
-			if (truncation.truncated) {
-				fallbackText += `\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)})]`;
-			}
-			fallbackText += `\n\n⚠️ LLM processing failed: ${(agentResult as SubAgentError).error}. Returning raw extracted content instead.`;
-
-			return {
-				content: [{ type: "text", text: fallbackText }],
-			};
-		}
-
-		// No prompt — check content size
-		if (markdown.length <= CONTENT_SIZE_THRESHOLD) {
-			// Short content: return directly
-			return {
-				content: [{ type: "text", text: markdown }],
-			};
-		}
-
-		// Large content: summarize via sub-agent if model available, otherwise truncate
-		if (!model) {
-			const truncation = truncateHead(markdown, {
-				maxLines: DEFAULT_MAX_LINES,
-				maxBytes: DEFAULT_MAX_BYTES,
-			});
-
-			let text = truncation.content;
-			if (truncation.truncated) {
-				text += `\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)})]`;
-			}
-			return { content: [{ type: "text", text }] };
-		}
-
-		onUpdate?.({ content: [{ type: "text", text: "Page content is large — generating summary..." }] });
-
-		const summaryResult = await withTimeout(runSubAgent(markdown, SUMMARIZE_PROMPT, model, thinkingLevel, signal), SUBAGENT_TIMEOUT_MS, "LLM summarization", signal).catch((err): SubAgentError => ({ ok: false, error: err.message }));
-		if (summaryResult.ok) {
-			return {
-				content: [{ type: "text", text: summaryResult.response }],
-			};
-		}
-
-		// Fallback: return truncated raw markdown
-		const truncation = truncateHead(markdown, {
-			maxLines: DEFAULT_MAX_LINES,
-			maxBytes: DEFAULT_MAX_BYTES,
-		});
-
-		let fallbackText = truncation.content;
-		if (truncation.truncated) {
-			fallbackText += `\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)})]`;
-		}
-		fallbackText += `\n\n⚠️ Could not generate summary: ${(summaryResult as SubAgentError).error}. Returning truncated raw content. Consider calling web_fetch again with a prompt to extract specific information.`;
-
-		return {
-			content: [{ type: "text", text: fallbackText }],
-		};
 	}
 }
