@@ -25,7 +25,12 @@
     "types.ts",
     "registry.ts",
     "browser-pool.ts",
-    "README.md"
+    "fetch-page.ts",
+    "network-policy.ts",
+    "result.ts",
+    "storage.ts",
+    "README.md",
+    "LICENSE"
   ],
   "exports": {
     ".": "./index.ts",

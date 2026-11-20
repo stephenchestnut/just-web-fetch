@@ -8,6 +8,9 @@ import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Text, Markdown, Container } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { BrowserPool } from "./browser-pool.js";
+import { fetchPage, PAGE_TIMEOUT_MS, type FetchedPage } from "./fetch-page.js";
+import { batchBudget, formatPageResult, type ExtractedPage, type FormatOptions } from "./result.js";
+import { cleanupSessionDirectories, DEFAULT_RETENTION_DAYS, EPHEMERAL_RETENTION_DAYS, FetchStore } from "./storage.js";
 
 // Re-export public types for extension authors
 export type {
@@ -34,11 +37,15 @@ import { ExtensionRegistry } from "./registry.js";
 interface WebFetchConfig {
 	/** Directory for local extensions. Defaults to <agent-dir>/just-web-fetch/extensions/ */
 	extensionsDir?: string;
+	/** Delete saved session directories unused for this many days. Defaults to 30; 0 disables cleanup. */
+	retentionDays?: number;
 }
 
 const AGENT_DIR = getAgentDir();
 const DATA_DIR = join(AGENT_DIR, "just-web-fetch");
 const CONFIG_PATH = join(AGENT_DIR, "just-web-fetch.json");
+const SESSIONS_DIR = join(DATA_DIR, "sessions");
+const EPHEMERAL_DIR = join(DATA_DIR, "ephemeral");
 
 /** Expand a leading ~ in a configured path. */
 function expandHome(path: string): string {
@@ -121,7 +128,6 @@ function setupEventBusRegistration(pi: ExtensionAPI): void {
 
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const CACHE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const PAGE_TIMEOUT_MS = 10_000; // 10 seconds
 const EXTRACT_TIMEOUT_MS = 10_000; // 10 seconds for trafilatura extraction
 export const MAX_BATCH_SIZE = 10; // Maximum pages in a single batch call
 
@@ -142,24 +148,24 @@ interface BatchDetails {
 // --- Cache ---
 
 interface CacheEntry {
-	content: string;
+	page: ExtractedPage;
 	timestamp: number;
 }
 
 const cache = new Map<string, CacheEntry>();
 
-function getCached(url: string): string | null {
+function getCached(url: string): ExtractedPage | null {
 	const entry = cache.get(url);
 	if (!entry) return null;
 	if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
 		cache.delete(url);
 		return null;
 	}
-	return entry.content;
+	return entry.page;
 }
 
-function setCache(url: string, content: string): void {
-	cache.set(url, { content, timestamp: Date.now() });
+function setCache(url: string, page: ExtractedPage): void {
+	cache.set(url, { page, timestamp: Date.now() });
 }
 
 function cleanupCache(): void {
@@ -302,83 +308,6 @@ async function detectPythonRunner(execFn: ExtensionAPI["exec"]): Promise<PythonR
 
 	runnerDetectionDone = true;
 	return null;
-}
-
-// --- Page Fetching ---
-
-interface FetchResult {
-	html: string;
-	finalUrl: string;
-}
-
-interface RedirectResult {
-	redirectedTo: string;
-}
-
-async function fetchPage(
-	url: string,
-	signal?: AbortSignal,
-): Promise<{ ok: true; result: FetchResult } | { ok: true; redirect: RedirectResult } | { ok: false; error: string }> {
-	let page: Awaited<ReturnType<typeof browserPool.acquire>> | null = null;
-
-	try {
-		if (signal?.aborted) return { ok: false, error: "Aborted" };
-
-		page = await browserPool.acquire(signal);
-
-		// Track redirects
-		const requestUrl = new URL(url);
-		let crossHostRedirect: string | null = null;
-
-		page.on("response", (response) => {
-			// Only track redirects for the main navigation request, not sub-resources
-			// (scripts, images, analytics, etc. often redirect cross-host)
-			if (!response.request().isNavigationRequest()) return;
-
-			const status = response.status();
-			if (status >= 300 && status < 400) {
-				const location = response.headers()["location"];
-				if (location) {
-					try {
-						const redirectUrl = new URL(location, url);
-						if (redirectUrl.hostname !== requestUrl.hostname) {
-							crossHostRedirect = redirectUrl.toString();
-						}
-					} catch {
-						// ignore malformed redirect URLs
-					}
-				}
-			}
-		});
-
-		try {
-			await page.goto(url, {
-				waitUntil: "networkidle2",
-				timeout: PAGE_TIMEOUT_MS,
-			});
-		} catch (err: any) {
-			if (signal?.aborted) return { ok: false, error: "Aborted" };
-			if (err.name === "TimeoutError" || err.message?.includes("timeout")) {
-				return { ok: false, error: `Page load timed out after ${PAGE_TIMEOUT_MS / 1000} seconds for URL: ${url}` };
-			}
-			return { ok: false, error: `Failed to load page: ${err.message}` };
-		}
-
-		// Check for cross-host redirect
-		if (crossHostRedirect) {
-			return { ok: true, redirect: { redirectedTo: crossHostRedirect } };
-		}
-
-		const html = await page.content();
-		const finalUrl = page.url();
-
-		return { ok: true, result: { html, finalUrl } };
-	} catch (err: any) {
-		if (signal?.aborted) return { ok: false, error: "Aborted" };
-		return { ok: false, error: `Browser error: ${err.message}` };
-	} finally {
-		if (page) await browserPool.release(page);
-	}
 }
 
 // --- Content Extraction ---
@@ -555,6 +484,8 @@ function renderBatchStatus(pages: BatchPageState[], theme: any): Container {
 
 export default function (pi: ExtensionAPI) {
 	let cleanupInterval: ReturnType<typeof setInterval> | null = null;
+	let store: FetchStore | null = null;
+	let storeError: string | null = null;
 
 	// Dependency check and extension loading on session start
 	pi.on("session_start", async (_event, ctx) => {
@@ -573,7 +504,24 @@ export default function (pi: ExtensionAPI) {
 		const localDir = config.extensionsDir ? expandHome(config.extensionsDir) : join(DATA_DIR, "extensions");
 		await loadLocalExtensions(localDir, ctx.ui.notify.bind(ctx.ui));
 
-		// 3. Signal readiness to other Pi extensions
+		// 3. Open storage for complete extractions and remove stale session directories
+		try {
+			store = await FetchStore.open({
+				sessionsRoot: SESSIONS_DIR,
+				ephemeralRoot: EPHEMERAL_DIR,
+				sessionId: ctx.sessionManager.getSessionId(),
+				persisted: ctx.sessionManager.getSessionFile() !== undefined,
+			});
+			storeError = null;
+			const retentionDays = config.retentionDays ?? DEFAULT_RETENTION_DAYS;
+			await cleanupSessionDirectories(SESSIONS_DIR, { retentionDays, keep: store.directory });
+			await cleanupSessionDirectories(EPHEMERAL_DIR, { retentionDays: EPHEMERAL_RETENTION_DAYS, keep: store.directory });
+		} catch (err: any) {
+			storeError = `could not prepare storage: ${err?.message || String(err)}`;
+			ctx.ui.notify(`web_fetch: ${storeError}`, "warning");
+		}
+
+		// 4. Signal readiness to other Pi extensions
 		pi.events.emit("web-fetch:ready", undefined);
 
 		// Start cache cleanup interval
@@ -581,13 +529,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Clean up on shutdown
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
 		if (cleanupInterval) {
 			clearInterval(cleanupInterval);
 			cleanupInterval = null;
 		}
 		cache.clear();
 		await browserPool.shutdown();
+		try {
+			// `reason` is available in current Pi; older versions omit it, so ephemeral files are removed.
+			await store?.close((event as { reason?: string } | undefined)?.reason);
+		} catch {
+			// Best-effort cleanup; stale ephemeral directories are removed on a later start.
+		}
+		store = null;
 	});
 
 	// Register the web_fetch tool
@@ -601,8 +556,14 @@ export default function (pi: ExtensionAPI) {
 			"Batch mode: use 'pages' instead of 'url' to fetch multiple URLs in a single call.",
 			"The 'url' and 'pages' parameters are mutually exclusive. Maximum 10 pages per batch.",
 			"",
+			"Output:",
+			"- Each result starts with source metadata: final URL, requested URL and redirects when they differ, and the path of the saved Markdown file.",
+			"- The complete extraction is always saved to that file. When it is too large to return inline, the result is a clearly marked PREVIEW ONLY; use read or grep on the saved file for the rest.",
+			"",
 			"Behavior notes:",
 			"- URLs must include the scheme (e.g. https://). Plain HTTP is upgraded to HTTPS.",
+			"- Redirects are followed automatically. Redirects from HTTPS to HTTP are rejected.",
+			"- Requests to localhost, private networks, link-local/cloud metadata and other special-purpose addresses are blocked. Use bash with curl for local services.",
 			"- Extracted content is held in a short-lived cache.",
 		].join("\n"),
 		parameters: Type.Object({
@@ -686,7 +647,7 @@ export default function (pi: ExtensionAPI) {
 				return renderBatchStatus(batchDetails.pages, theme);
 			}
 
-			const isError = result.isError;
+			const isError = (result as { isError?: boolean }).isError;
 			const textContent = result.content[0];
 			const text = textContent?.type === "text" ? textContent.text : "(no output)";
 
@@ -715,12 +676,13 @@ export default function (pi: ExtensionAPI) {
 	 */
 	async function processSingleUrl(
 		rawUrl: string,
+		format: FormatOptions,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
 	) {
 		// 1. Validate and normalize URL
 		const urlResult = validateAndNormalizeUrl(rawUrl);
-		if (urlResult.error) {
+		if (urlResult.url === undefined) {
 			return {
 				content: [{ type: "text", text: urlResult.error }],
 				isError: true,
@@ -735,7 +697,7 @@ export default function (pi: ExtensionAPI) {
 		// 2. Check cache (before hooks, since beforeFetch may short-circuit)
 		const cached = getCached(url);
 		if (cached) {
-			return { content: [{ type: "text", text: cached }] };
+			return { content: [{ type: "text", text: formatPageResult(cached, format) }] };
 		}
 
 		// 3. beforeFetch hook — can short-circuit entire pipeline
@@ -749,7 +711,8 @@ export default function (pi: ExtensionAPI) {
 		// 4. Fetch page
 		const fetchOuter = await runFetch(url, signal, onUpdate);
 		if (fetchOuter.done) return fetchOuter.result;
-		let html = fetchOuter.html;
+		const fetched = fetchOuter.page;
+		let html = fetched.html;
 
 		// 5. afterFetch hook — can replace HTML or short-circuit
 		if (matchedExtension?.afterFetch) {
@@ -787,11 +750,29 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		// 8. Store in cache
-		setCache(url, markdown);
+		// 8. Save the complete extraction
+		const page: ExtractedPage = {
+			requestedUrl: fetched.requestedUrl,
+			finalUrl: fetched.finalUrl,
+			redirectChain: fetched.redirectChain,
+			blockedRequests: fetched.blockedRequests,
+			markdown,
+		};
+		if (store) {
+			try {
+				page.savedPath = await store.save({ ...page, fetchedAt: new Date() });
+			} catch (err: any) {
+				page.saveError = `could not save extraction: ${err?.message || String(err)}`;
+			}
+		} else {
+			page.saveError = storeError ?? "storage is not available";
+		}
 
-		// 9. Return extracted content
-		return { content: [{ type: "text", text: markdown }] };
+		// 9. Cache only successfully saved pages, so cached results always include a valid file path
+		if (page.savedPath) setCache(url, page);
+
+		// 10. Return extracted content
+		return { content: [{ type: "text", text: formatPageResult(page, format) }] };
 	}
 
 	// --- Batch Execution ---
@@ -806,7 +787,7 @@ export default function (pi: ExtensionAPI) {
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
 	) {
-		const total = pages.length;
+		const format: FormatOptions = pages.length === 1 ? {} : batchBudget(pages.length);
 
 		// Track per-page status for UI
 		const pageStates: BatchPageState[] = pages.map((p) => ({
@@ -839,7 +820,7 @@ export default function (pi: ExtensionAPI) {
 				emitBatchUpdate();
 			};
 
-			const result = await processSingleUrl(page.url, signal, pageOnUpdate);
+			const result = await processSingleUrl(page.url, format, signal, pageOnUpdate);
 
 			// Mark done or error based on result
 			if (result.isError) {
@@ -865,43 +846,27 @@ export default function (pi: ExtensionAPI) {
 
 	/**
 	 * Stage: Fetch page via puppeteer.
-	 * Returns either a done result (error/redirect) or the HTML to continue processing.
+	 * Returns either a done result (error) or the fetched page to continue processing.
 	 */
 	async function runFetch(
 		url: string,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
-	): Promise<{ done: true; result: any } | { done: false; html: string }> {
-		onUpdate?.({ content: [{ type: "text", text: `Fetching ${url}...` }] });
+	): Promise<{ done: true; result: any } | { done: false; page: FetchedPage }> {
+		onUpdate?.({ content: [{ type: "text", text: `Fetching ${url}...` }], details: undefined });
 
-		const fetchResult = await fetchPage(url, signal);
+		const fetchResult = await fetchPage(browserPool, url, { signal, timeoutMs: PAGE_TIMEOUT_MS });
 		if (!fetchResult.ok) {
 			return {
 				done: true,
 				result: {
-					content: [{ type: "text", text: (fetchResult as { ok: false; error: string }).error }],
+					content: [{ type: "text", text: fetchResult.error }],
 					isError: true,
 				},
 			};
 		}
 
-		// Handle cross-host redirect
-		if ("redirect" in fetchResult) {
-			const redirectUrl = (fetchResult as { ok: true; redirect: RedirectResult }).redirect.redirectedTo;
-			return {
-				done: true,
-				result: {
-					content: [
-						{
-							type: "text",
-							text: `The URL redirected to a different host: ${redirectUrl}\n\nTo fetch the content, make a new web_fetch call with this URL: ${redirectUrl}`,
-						},
-					],
-				},
-			};
-		}
-
-		return { done: false, html: fetchResult.result.html };
+		return { done: false, page: fetchResult.page };
 	}
 
 	/**
@@ -913,7 +878,7 @@ export default function (pi: ExtensionAPI) {
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
 	): Promise<{ done: true; result: any } | { done: false; markdown: string }> {
-		onUpdate?.({ content: [{ type: "text", text: "Extracting content..." }] });
+		onUpdate?.({ content: [{ type: "text", text: "Extracting content..." }], details: undefined });
 
 		const extractResult = await withTimeout(extractContent(html, signal), EXTRACT_TIMEOUT_MS, "Content extraction", signal).catch((err): { ok: false; error: string } => ({ ok: false, error: err.message }));
 		if (!extractResult.ok) {
