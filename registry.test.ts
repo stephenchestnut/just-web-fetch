@@ -80,29 +80,22 @@ describe("ExtensionRegistry", () => {
 	describe("count and counts", () => {
 		it("starts empty", () => {
 			expect(registry.count).toBe(0);
-			expect(registry.counts).toEqual({ eventBus: 0, local: 0, builtIn: 0 });
+			expect(registry.counts).toEqual({ eventBus: 0, local: 0 });
 		});
 
 		it("tracks counts per source", () => {
-			registry.addBuiltIn(makeExt("b1", ["a.com/**"]));
-			registry.addBuiltIn(makeExt("b2", ["b.com/**"]));
 			registry.addLocal(makeExt("l1", ["c.com/**"]));
+			registry.addLocal(makeExt("l2", ["b.com/**"]));
 			registry.addEventBus(makeExt("e1", ["d.com/**"]));
 
-			expect(registry.count).toBe(4);
-			expect(registry.counts).toEqual({ eventBus: 1, local: 1, builtIn: 2 });
+			expect(registry.count).toBe(3);
+			expect(registry.counts).toEqual({ eventBus: 1, local: 2 });
 		});
 	});
 
 	describe("match", () => {
 		it("returns null when no extensions registered", () => {
 			expect(registry.match("https://example.com/page")).toBeNull();
-		});
-
-		it("matches built-in extension", () => {
-			const ext = makeExt("builtin", ["example.com/**"]);
-			registry.addBuiltIn(ext);
-			expect(registry.match("https://example.com/page")).toBe(ext);
 		});
 
 		it("matches local extension", () => {
@@ -118,7 +111,7 @@ describe("ExtensionRegistry", () => {
 		});
 
 		it("returns null when no extension matches", () => {
-			registry.addBuiltIn(makeExt("b", ["other.com/**"]));
+			registry.addLocal(makeExt("local", ["other.com/**"]));
 			expect(registry.match("https://example.com/page")).toBeNull();
 		});
 	});
@@ -134,57 +127,24 @@ describe("ExtensionRegistry", () => {
 			expect(registry.match("https://example.com/page")).toBe(eventBusExt);
 		});
 
-		it("event-bus takes priority over built-in", () => {
-			const eventBusExt = makeExt("eventbus", ["example.com/**"]);
-			const builtInExt = makeExt("builtin", ["example.com/**"]);
-
-			registry.addBuiltIn(builtInExt);
-			registry.addEventBus(eventBusExt);
-
-			expect(registry.match("https://example.com/page")).toBe(eventBusExt);
-		});
-
-		it("local takes priority over built-in", () => {
+		it("falls through to lower priority when higher doesn't match", () => {
+			const eventBusExt = makeExt("eventbus", ["other.com/**"]);
 			const localExt = makeExt("local", ["example.com/**"]);
-			const builtInExt = makeExt("builtin", ["example.com/**"]);
 
-			registry.addBuiltIn(builtInExt);
+			registry.addEventBus(eventBusExt);
 			registry.addLocal(localExt);
 
 			expect(registry.match("https://example.com/page")).toBe(localExt);
 		});
-
-		it("full priority: event-bus > local > built-in", () => {
-			const eventBusExt = makeExt("eventbus", ["example.com/**"]);
-			const localExt = makeExt("local", ["example.com/**"]);
-			const builtInExt = makeExt("builtin", ["example.com/**"]);
-
-			// Add in reverse priority order to ensure ordering is structural, not insertion-based
-			registry.addBuiltIn(builtInExt);
-			registry.addLocal(localExt);
-			registry.addEventBus(eventBusExt);
-
-			expect(registry.match("https://example.com/page")).toBe(eventBusExt);
-		});
-
-		it("falls through to lower priority when higher doesn't match", () => {
-			const eventBusExt = makeExt("eventbus", ["other.com/**"]);
-			const builtInExt = makeExt("builtin", ["example.com/**"]);
-
-			registry.addEventBus(eventBusExt);
-			registry.addBuiltIn(builtInExt);
-
-			expect(registry.match("https://example.com/page")).toBe(builtInExt);
-		});
 	});
 
 	describe("registration order within same source", () => {
-		it("first registered wins within built-in", () => {
+		it("first registered wins within local", () => {
 			const ext1 = makeExt("first", ["example.com/**"]);
 			const ext2 = makeExt("second", ["example.com/**"]);
 
-			registry.addBuiltIn(ext1);
-			registry.addBuiltIn(ext2);
+			registry.addLocal(ext1);
+			registry.addLocal(ext2);
 
 			expect(registry.match("https://example.com/page")).toBe(ext1);
 		});

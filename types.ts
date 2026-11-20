@@ -1,5 +1,5 @@
 // --- Extension Types ---
-// Public API for pi-web-fetch extension authors
+// Public API for just-web-fetch extension authors
 
 /**
  * Content block in a tool result (matches Pi's content types).
@@ -33,15 +33,8 @@ export interface HookContext {
 	url: string;
 	/** Parsed URL object */
 	parsedUrl: URL;
-	/** User's prompt, if provided */
-	prompt?: string;
 	/** Abort signal for cancellation */
 	signal?: AbortSignal;
-	/**
-	 * Helper to create a redirect/rejection result.
-	 * Returns a HookResult with the message as text content.
-	 */
-	redirect(message: string): HookResult;
 }
 
 /**
@@ -59,29 +52,24 @@ export interface AfterExtractHookContext extends HookContext {
 }
 
 /**
- * Context for the summarize hook — includes markdown and optional prompt.
- */
-export interface SummarizeHookContext extends HookContext {
-	markdown: string;
-}
-
-/**
  * A web-fetch extension that handles site-specific fetch behavior.
  *
  * Extensions are modules whose default export is a factory function returning
- * a WebFetchExtension object. The same interface is used for built-in, local,
- * and event-bus extensions.
+ * a WebFetchExtension object. The same interface is used for local and
+ * event-bus extensions.
  *
  * @example
  * ```typescript
- * import type { WebFetchExtension } from "pi-web-fetch";
+ * import type { WebFetchExtension } from "just-web-fetch/types";
  *
  * export default function (): WebFetchExtension {
  *   return {
  *     name: "my-handler",
  *     matches: ["example.com/**"],
  *     async beforeFetch(ctx) {
- *       return ctx.redirect("Use a different tool for this site.");
+ *       return {
+ *         content: [{ type: "text", text: "Use a different tool for this site." }],
+ *       };
  *     },
  *   };
  * }
@@ -95,7 +83,7 @@ export interface WebFetchExtension {
 	/**
 	 * URL glob patterns to match against hostname + pathname.
 	 * Uses picomatch syntax: `*` matches a single segment, `**` matches multiple.
-	 * @example ["github.com/​*​/​*​/blob/**", "docs.google.com/**"]
+	 * @example ["example.com/**", "docs.example.com/​*​/guide/**"]
 	 */
 	matches: string[];
 
@@ -122,31 +110,16 @@ export interface WebFetchExtension {
 	 */
 	afterExtract?(ctx: AfterExtractHookContext): Promise<HookResult | string | void>;
 
-	/**
-	 * Called before sub-agent summarization.
-	 * Return a HookResult to replace the default sub-agent processing.
-	 * Return void to proceed with normal summarization.
-	 */
-	summarize?(ctx: SummarizeHookContext): Promise<HookResult | void>;
 }
 
 /**
  * Create a HookContext for the given URL and options.
- * Used internally by pi-web-fetch; exported for testing.
+ * Used internally by just-web-fetch; exported for testing.
  */
-export function createHookContext(
-	url: string,
-	options?: { prompt?: string; signal?: AbortSignal },
-): HookContext {
+export function createHookContext(url: string, options?: { signal?: AbortSignal }): HookContext {
 	return {
 		url,
 		parsedUrl: new URL(url),
-		prompt: options?.prompt,
 		signal: options?.signal,
-		redirect(message: string): HookResult {
-			return {
-				content: [{ type: "text", text: message }],
-			};
-		},
 	};
 }

@@ -198,8 +198,8 @@ describe("formatBatchResults", () => {
 			expect(result.content).toHaveLength(0);
 		});
 
-		it("returns content directly for single page with prompt", () => {
-			const pages = [{ url: "https://example.com", prompt: "Get the title" }];
+		it("returns content directly for single page", () => {
+			const pages = [{ url: "https://example.com" }];
 			const results = [fulfilled(okResult("Title: Example"))];
 
 			const result = formatBatchResults(pages, results);

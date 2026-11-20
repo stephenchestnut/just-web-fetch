@@ -4,7 +4,7 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { truncateHead, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
+import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Text, Markdown, Container } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { BrowserPool } from "./browser-pool.js";
@@ -16,7 +16,6 @@ export type {
 	HookResult,
 	AfterFetchHookContext,
 	AfterExtractHookContext,
-	SummarizeHookContext,
 	ToolContent,
 } from "./types.js";
 
@@ -26,7 +25,6 @@ import type {
 	HookResult,
 	AfterFetchHookContext,
 	AfterExtractHookContext,
-	SummarizeHookContext,
 } from "./types.js";
 import { createHookContext } from "./types.js";
 import { ExtensionRegistry } from "./registry.js";
@@ -34,15 +32,18 @@ import { ExtensionRegistry } from "./registry.js";
 // --- Config ---
 
 interface WebFetchConfig {
-	/** Model for LLM processing (e.g. "provider/model-id"). Defaults to the current session model. */
-	model?: string;
-	/** Thinking level for the sub-agent. Defaults to the current session thinking level. */
-	thinkingLevel?: string;
-	/** Custom directory path for local extensions. Defaults to ~/.pi/extensions/web-fetch/ */
+	/** Directory for local extensions. Defaults to <agent-dir>/just-web-fetch/extensions/ */
 	extensionsDir?: string;
 }
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "web-fetch.json");
+const AGENT_DIR = getAgentDir();
+const DATA_DIR = join(AGENT_DIR, "just-web-fetch");
+const CONFIG_PATH = join(AGENT_DIR, "just-web-fetch.json");
+
+/** Expand a leading ~ in a configured path. */
+function expandHome(path: string): string {
+	return path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+}
 
 function loadConfig(): WebFetchConfig {
 	try {
@@ -63,42 +64,6 @@ const browserPool = new BrowserPool({ maxTabs: MAX_BROWSER_TABS, idleTimeoutMs: 
 // --- Extension Loading ---
 
 type NotifyFn = (message: string, level: "info" | "warning" | "error") => void;
-
-/**
- * Load built-in extensions from the extensions/ directory relative to this file.
- */
-async function loadBuiltInExtensions(notify: NotifyFn): Promise<void> {
-	const thisDir = dirname(fileURLToPath(import.meta.url));
-	const extensionsDir = join(thisDir, "extensions");
-
-	if (!existsSync(extensionsDir)) {
-		return;
-	}
-
-	const files = readdirSync(extensionsDir).filter(
-		(f) => f.endsWith(".ts") || f.endsWith(".js"),
-	);
-
-	for (const file of files) {
-		try {
-			const modulePath = join(extensionsDir, file);
-			const mod = await import(modulePath);
-			const factory = mod.default;
-			if (typeof factory !== "function") {
-				notify(`web-fetch: built-in extension ${file} has no default export function, skipping`, "warning");
-				continue;
-			}
-			const ext: WebFetchExtension = factory();
-			if (!ext.name || !ext.matches) {
-				notify(`web-fetch: built-in extension ${file} missing name or matches, skipping`, "warning");
-				continue;
-			}
-			registry.addBuiltIn(ext);
-		} catch (err: any) {
-			notify(`web-fetch: failed to load built-in extension ${file}: ${err.message}`, "error");
-		}
-	}
-}
 
 /**
  * Load local extensions from a user directory.
@@ -158,13 +123,11 @@ const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const CACHE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const PAGE_TIMEOUT_MS = 10_000; // 10 seconds
 const EXTRACT_TIMEOUT_MS = 10_000; // 10 seconds for trafilatura extraction
-const SUBAGENT_TIMEOUT_MS = 10_000; // 10 seconds for LLM sub-agent processing
-const CONTENT_SIZE_THRESHOLD = 50_000; // ~50KB — above this, summarize instead of returning raw
 export const MAX_BATCH_SIZE = 10; // Maximum pages in a single batch call
 
 // --- Batch Status Types ---
 
-type BatchPageStatus = "pending" | "fetching" | "extracting" | "summarizing" | "done" | "error";
+type BatchPageStatus = "pending" | "fetching" | "extracting" | "done" | "error";
 
 interface BatchPageState {
 	url: string;
@@ -175,18 +138,6 @@ interface BatchPageState {
 interface BatchDetails {
 	pages: BatchPageState[];
 }
-
-const CONTENT_GUARDRAILS = `Respond concisely using only the page content above.
-- Keep direct quotes under 125 characters and always use quotation marks for exact wording.
-- Outside of quotes, rephrase in your own words — never reproduce source text verbatim.
-- Open-source code and documentation snippets are fine to include as-is.`;
-
-const SUMMARIZE_PROMPT = `Summarize this page:
-1. A 2-3 sentence overview of the page's purpose.
-2. For each major section or heading, its name and a 1-2 sentence description.
-3. End with: "To extract specific information, call web_fetch again with the same URL and a prompt. The page is cached so re-fetching is instant."
-
-${CONTENT_GUARDRAILS}`;
 
 // --- Cache ---
 
@@ -496,103 +447,6 @@ async function extractContent(
 	});
 }
 
-// --- Sub-Agent ---
-
-interface SubAgentResult {
-	ok: true;
-	response: string;
-}
-
-interface SubAgentError {
-	ok: false;
-	error: string;
-}
-
-async function runSubAgent(
-	content: string,
-	prompt: string,
-	model: string,
-	thinkingLevel: string,
-	signal?: AbortSignal,
-): Promise<SubAgentResult | SubAgentError> {
-	if (signal?.aborted) return { ok: false, error: "Aborted" };
-
-	const fullPrompt = `Web page content:\n---\n${content}\n---\n\n${prompt}`;
-
-	return new Promise((resolve) => {
-		const proc = spawn("pi", [
-			"--mode", "json",
-			"-p",
-			"--no-session",
-			"--no-tools",
-			"--model", model,
-			"--thinking", thinkingLevel,
-			fullPrompt,
-		], {
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-
-		let buffer = "";
-		let lastAssistantText = "";
-		let stderr = "";
-
-		const onAbort = () => killProcess(proc);
-		signal?.addEventListener("abort", onAbort, { once: true });
-
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			try {
-				const event = JSON.parse(line);
-				if (event.type === "message_end" && event.message?.role === "assistant") {
-					for (const part of event.message.content) {
-						if (part.type === "text") {
-							lastAssistantText = part.text;
-						}
-					}
-				}
-			} catch {
-				// ignore non-JSON lines
-			}
-		};
-
-		proc.stdout.on("data", (data) => {
-			buffer += data.toString();
-			const lines = buffer.split("\n");
-			buffer = lines.pop() || "";
-			for (const line of lines) processLine(line);
-		});
-
-		proc.stderr.on("data", (data) => {
-			stderr += data.toString();
-		});
-
-		proc.on("close", (code) => {
-			signal?.removeEventListener("abort", onAbort);
-
-			// Process any remaining buffer
-			if (buffer.trim()) processLine(buffer);
-
-			if (signal?.aborted) {
-				resolve({ ok: false, error: "Aborted" });
-				return;
-			}
-
-			if (lastAssistantText) {
-				resolve({ ok: true, response: lastAssistantText });
-			} else if (code !== 0) {
-				resolve({ ok: false, error: `Sub-agent failed (exit code ${code}): ${stderr.trim() || "(no output)"}` });
-			} else {
-				resolve({ ok: false, error: "Sub-agent returned no response" });
-			}
-		});
-
-		proc.on("error", (err) => {
-			signal?.removeEventListener("abort", onAbort);
-			resolve({ ok: false, error: `Failed to spawn pi sub-agent: ${err.message}` });
-		});
-	});
-}
-
 // --- Batch Result Formatting ---
 
 /**
@@ -600,7 +454,7 @@ async function runSubAgent(
  * Exported for testing.
  */
 export function formatBatchResults(
-	pages: Array<{ url: string; prompt?: string }>,
+	pages: Array<{ url: string }>,
 	results: PromiseSettledResult<any>[],
 ) {
 	const total = pages.length;
@@ -652,7 +506,6 @@ const STATUS_ICONS: Record<BatchPageStatus, string> = {
 	pending: "○",
 	fetching: "◐",
 	extracting: "◑",
-	summarizing: "◕",
 	done: "●",
 	error: "✗",
 };
@@ -661,7 +514,6 @@ const STATUS_LABELS: Record<BatchPageStatus, string> = {
 	pending: "waiting",
 	fetching: "fetching",
 	extracting: "extracting",
-	summarizing: "summarizing",
 	done: "done",
 	error: "error",
 };
@@ -717,14 +569,11 @@ export default function (pi: ExtensionAPI) {
 		// 1. Subscribe to event bus registrations (persistent for session lifetime)
 		setupEventBusRegistration(pi);
 
-		// 2. Load built-in extensions
-		await loadBuiltInExtensions(ctx.ui.notify.bind(ctx.ui));
-
-		// 3. Load local extensions
-		const localDir = config.extensionsDir || join(homedir(), ".pi", "extensions", "web-fetch");
+		// 2. Load local extensions
+		const localDir = config.extensionsDir ? expandHome(config.extensionsDir) : join(DATA_DIR, "extensions");
 		await loadLocalExtensions(localDir, ctx.ui.notify.bind(ctx.ui));
 
-		// 4. Signal readiness to other Pi extensions
+		// 3. Signal readiness to other Pi extensions
 		pi.events.emit("web-fetch:ready", undefined);
 
 		// Start cache cleanup interval
@@ -746,48 +595,29 @@ export default function (pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Web Fetch",
 		description: [
-			"Retrieves and extracts the main content of a web page as markdown.",
+			"Retrieves a web page in headless Chrome and extracts its main content as Markdown.",
+			"It never summarizes or answers questions about the page; analyze the returned content yourself.",
 			"",
-			"Include a 'prompt' parameter to have an LLM distill the page down to just the information you need \u2014 this saves significant context compared to ingesting raw page content.",
-			"Without a prompt, the full extracted markdown is returned (or a structured overview if the page is large).",
-			"",
-			"Batch mode: use 'pages' instead of 'url' to fetch multiple URLs in a single call. Each entry can have its own prompt.",
-			"This is much faster than making separate web_fetch calls when you need content from several pages.",
+			"Batch mode: use 'pages' instead of 'url' to fetch multiple URLs in a single call.",
 			"The 'url' and 'pages' parameters are mutually exclusive. Maximum 10 pages per batch.",
 			"",
-			"When to use something else:",
-			"- The gh CLI (via bash) for anything on GitHub \u2014 issues, PRs, repo contents, API calls.",
-			"",
 			"Behavior notes:",
-			"- URLs must include the scheme (e.g. https://). Plain HTTP is silently upgraded to HTTPS.",
-			"- Fetched content is held in a short-lived cache, so asking multiple questions about the same page is cheap.",
-			"- Cross-host redirects are surfaced rather than followed \u2014 make a second request to the target URL.",
-			"- No files or external state are modified by this tool.",
+			"- URLs must include the scheme (e.g. https://). Plain HTTP is upgraded to HTTPS.",
+			"- Extracted content is held in a short-lived cache.",
 		].join("\n"),
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "Fully-formed URL to fetch (e.g., https://example.com/page). Mutually exclusive with 'pages'." })),
-			prompt: Type.Optional(
-				Type.String({
-					description:
-						"What information to extract from the page. Strongly recommended \u2014 the page content will be processed by a fast LLM and only relevant information returned. Omit only if you need the full raw content. Only used with 'url', not 'pages'.",
-				}),
-			),
 			pages: Type.Optional(
 				Type.Array(
 					Type.Object({
 						url: Type.String({ description: "Fully-formed URL to fetch" }),
-						prompt: Type.Optional(Type.String({ description: "What information to extract from this page" })),
 					}),
-					{ maxItems: MAX_BATCH_SIZE, description: `Array of pages to fetch concurrently (max ${MAX_BATCH_SIZE}). Mutually exclusive with 'url'. Each entry can have its own prompt.` },
+					{ maxItems: MAX_BATCH_SIZE, description: `Array of pages to fetch concurrently (max ${MAX_BATCH_SIZE}). Mutually exclusive with 'url'.` },
 				),
 			),
 		}),
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			// Resolve model and thinking level: config file → current session
-			const model = config.model || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
-			const thinkingLevel = config.thinkingLevel || pi.getThinkingLevel();
-
+		async execute(_toolCallId, params, signal, onUpdate) {
 			// --- Parameter validation ---
 			const hasUrl = params.url !== undefined && params.url !== null;
 			const hasPages = params.pages !== undefined && params.pages !== null;
@@ -822,11 +652,11 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// --- Batch mode ---
-				return await executeBatch(pages, model, thinkingLevel, signal, onUpdate);
+				return await executeBatch(pages, signal, onUpdate);
 			}
 
 			// --- Single URL mode — route through batch for unified status view ---
-			return await executeBatch([{ url: params.url!, prompt: params.prompt }], model, thinkingLevel, signal, onUpdate);
+			return await executeBatch([{ url: params.url! }], signal, onUpdate);
 		},
 
 		renderCall(args, theme) {
@@ -846,9 +676,6 @@ export default function (pi: ExtensionAPI) {
 			const url = args.url || "...";
 			const shortUrl = url.length > 70 ? url.slice(0, 70) + "..." : url;
 			let text = theme.fg("toolTitle", theme.bold("web_fetch ")) + theme.fg("accent", shortUrl);
-			if (args.prompt) {
-				text += "  " + theme.fg("dim", "\u00b7 " + args.prompt);
-			}
 			return new Text(text, 0, 0);
 		},
 
@@ -888,9 +715,6 @@ export default function (pi: ExtensionAPI) {
 	 */
 	async function processSingleUrl(
 		rawUrl: string,
-		prompt: string | undefined,
-		model: string | undefined,
-		thinkingLevel: string,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
 	) {
@@ -906,13 +730,12 @@ export default function (pi: ExtensionAPI) {
 
 		// Find matching extension (if any)
 		const matchedExtension = registry.match(url);
-		const hookCtx = createHookContext(url, { prompt, signal });
+		const hookCtx = createHookContext(url, { signal });
 
 		// 2. Check cache (before hooks, since beforeFetch may short-circuit)
 		const cached = getCached(url);
 		if (cached) {
-			onUpdate?.({ content: [{ type: "text", text: "Cache hit — processing..." }] });
-			return await runProcess(cached, url, prompt, model, thinkingLevel, matchedExtension, hookCtx, signal, onUpdate);
+			return { content: [{ type: "text", text: cached }] };
 		}
 
 		// 3. beforeFetch hook — can short-circuit entire pipeline
@@ -967,8 +790,8 @@ export default function (pi: ExtensionAPI) {
 		// 8. Store in cache
 		setCache(url, markdown);
 
-		// 9. Process and return (with summarize hook support)
-		return await runProcess(markdown, url, prompt, model, thinkingLevel, matchedExtension, hookCtx, signal, onUpdate);
+		// 9. Return extracted content
+		return { content: [{ type: "text", text: markdown }] };
 	}
 
 	// --- Batch Execution ---
@@ -979,9 +802,7 @@ export default function (pi: ExtensionAPI) {
 	 * and formatted into a single text block with per-page headers.
 	 */
 	async function executeBatch(
-		pages: Array<{ url: string; prompt?: string }>,
-		model: string | undefined,
-		thinkingLevel: string,
+		pages: Array<{ url: string }>,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
 	) {
@@ -1013,14 +834,12 @@ export default function (pi: ExtensionAPI) {
 						pageStates[i].status = "fetching";
 					} else if (msg.startsWith("Extracting")) {
 						pageStates[i].status = "extracting";
-					} else if (msg.startsWith("Processing") || msg.includes("summary") || msg.includes("Cache hit")) {
-						pageStates[i].status = "summarizing";
 					}
 				}
 				emitBatchUpdate();
 			};
 
-			const result = await processSingleUrl(page.url, page.prompt, model, thinkingLevel, signal, pageOnUpdate);
+			const result = await processSingleUrl(page.url, signal, pageOnUpdate);
 
 			// Mark done or error based on result
 			if (result.isError) {
@@ -1108,104 +927,5 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		return { done: false, markdown: extractResult.markdown };
-	}
-
-	/**
-	 * Stage: Process extracted content — summarize hook, sub-agent, or raw return.
-	 */
-	async function runProcess(
-		markdown: string,
-		url: string,
-		prompt: string | undefined,
-		model: string | undefined,
-		thinkingLevel: string,
-		matchedExtension: WebFetchExtension | null,
-		hookCtx: HookContext,
-		signal?: AbortSignal,
-		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
-	) {
-		// Check summarize hook before sub-agent
-		if (matchedExtension?.summarize) {
-			const summarizeCtx: SummarizeHookContext = { ...hookCtx, markdown };
-			const hookResult = await matchedExtension.summarize(summarizeCtx);
-			if (hookResult) {
-				return hookResult;
-			}
-		}
-
-		// Prompted path — use sub-agent if model available
-		if (prompt && model) {
-			onUpdate?.({ content: [{ type: "text", text: "Processing with LLM..." }] });
-
-			const agentResult = await withTimeout(runSubAgent(markdown, `${prompt}\n\n${CONTENT_GUARDRAILS}`, model, thinkingLevel, signal), SUBAGENT_TIMEOUT_MS, "LLM processing", signal).catch((err): SubAgentError => ({ ok: false, error: err.message }));
-			if (agentResult.ok) {
-				return {
-					content: [{ type: "text", text: agentResult.response }],
-				};
-			}
-
-			// Fallback: return raw markdown with truncation + error note
-			const truncation = truncateHead(markdown, {
-				maxLines: DEFAULT_MAX_LINES,
-				maxBytes: DEFAULT_MAX_BYTES,
-			});
-
-			let fallbackText = truncation.content;
-			if (truncation.truncated) {
-				fallbackText += `\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)})]`;
-			}
-			fallbackText += `\n\n⚠️ LLM processing failed: ${(agentResult as SubAgentError).error}. Returning raw extracted content instead.`;
-
-			return {
-				content: [{ type: "text", text: fallbackText }],
-			};
-		}
-
-		// No prompt — check content size
-		if (markdown.length <= CONTENT_SIZE_THRESHOLD) {
-			// Short content: return directly
-			return {
-				content: [{ type: "text", text: markdown }],
-			};
-		}
-
-		// Large content: summarize via sub-agent if model available, otherwise truncate
-		if (!model) {
-			const truncation = truncateHead(markdown, {
-				maxLines: DEFAULT_MAX_LINES,
-				maxBytes: DEFAULT_MAX_BYTES,
-			});
-
-			let text = truncation.content;
-			if (truncation.truncated) {
-				text += `\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)})]`;
-			}
-			return { content: [{ type: "text", text }] };
-		}
-
-		onUpdate?.({ content: [{ type: "text", text: "Page content is large — generating summary..." }] });
-
-		const summaryResult = await withTimeout(runSubAgent(markdown, SUMMARIZE_PROMPT, model, thinkingLevel, signal), SUBAGENT_TIMEOUT_MS, "LLM summarization", signal).catch((err): SubAgentError => ({ ok: false, error: err.message }));
-		if (summaryResult.ok) {
-			return {
-				content: [{ type: "text", text: summaryResult.response }],
-			};
-		}
-
-		// Fallback: return truncated raw markdown
-		const truncation = truncateHead(markdown, {
-			maxLines: DEFAULT_MAX_LINES,
-			maxBytes: DEFAULT_MAX_BYTES,
-		});
-
-		let fallbackText = truncation.content;
-		if (truncation.truncated) {
-			fallbackText += `\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)})]`;
-		}
-		fallbackText += `\n\n⚠️ Could not generate summary: ${(summaryResult as SubAgentError).error}. Returning truncated raw content. Consider calling web_fetch again with a prompt to extract specific information.`;
-
-		return {
-			content: [{ type: "text", text: fallbackText }],
-		};
 	}
 }
