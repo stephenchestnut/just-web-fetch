@@ -1,4 +1,6 @@
-# pi-web-fetch
+# just-web-fetch
+
+> A fork of [`georgebashi/pi-web-fetch`](https://github.com/georgebashi/pi-web-fetch) by George Bashi.
 
 A [pi](https://github.com/badlogic/pi-mono) extension that gives your agent a proper web browser. Fetches pages via headless Chrome, extracts clean content via [trafilatura](https://trafilatura.readthedocs.io/), and optionally distills it with an LLM.
 
@@ -43,52 +45,26 @@ Claude Code's WebFetch uses Turndown to convert HTML to markdown — a simple re
 
 ## Installation
 
+Install from Git:
+
 ```bash
-npm install pi-web-fetch
+pi install git:github.com/stephenchestnut/just-web-fetch@main
 ```
 
-Or clone for development:
+> **Important:** this package registers the same `web_fetch` tool name as `pi-web-fetch`. Install only one of them.
+
+For development:
 
 ```bash
-git clone https://github.com/georgebashi/pi-web-fetch
-cd pi-web-fetch
+git clone https://github.com/stephenchestnut/just-web-fetch
+cd just-web-fetch
 npm install
+pi -e .
 ```
 
-> **Note:** `npm install` will download puppeteer's bundled Chromium (~300MB). If you already have Chrome/Chromium installed, you can set `PUPPETEER_EXECUTABLE_PATH` to skip the download:
-> ```bash
-> export PUPPETEER_EXECUTABLE_PATH=/path/to/chrome
-> ```
+> **Note:** `npm install` downloads Puppeteer's bundled Chromium (~300MB). To use an existing Chrome or Chromium instead, set `PUPPETEER_SKIP_DOWNLOAD=1` during installation and `PUPPETEER_EXECUTABLE_PATH` when running Pi.
 
-> **Note:** The first time `web_fetch` runs, `uvx` will download the trafilatura package (~10MB). Subsequent runs use the cached environment and are fast.
-
-### Add to pi
-
-Add the package to your pi settings (`~/.pi/agent/settings.json`):
-
-```json
-{
-  "extensions": [
-    "pi-web-fetch"
-  ]
-}
-```
-
-Or point to a local checkout:
-
-```json
-{
-  "extensions": [
-    "/path/to/pi-web-fetch"
-  ]
-}
-```
-
-Or use the `-e` flag for quick testing:
-
-```bash
-pi -e pi-web-fetch
-```
+> **Note:** The first time `web_fetch` runs, `uvx` downloads the trafilatura package (~10MB). Subsequent runs use the cached environment.
 
 ## Usage
 
@@ -207,4 +183,4 @@ For batch mode, each URL runs through this pipeline independently with its own b
 
 ## License
 
-MIT
+MIT. Original work copyright (c) 2026 George Bashi; see [LICENSE](LICENSE).
