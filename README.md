@@ -108,6 +108,51 @@ Content: PREVIEW ONLY — first 96 of 3571 lines (4.0KB of 180.7KB). Complete ex
 - In batch mode, the inline output limit is shared across pages, and every page has its own saved file.
 - Blocked subresource requests, if any, are listed.
 
+### Codemode and structured results
+
+`web_fetch` declares an output schema. The model sees the text result above, while codemode scripts receive structured data instead:
+
+```ts
+{
+  pages: Array<
+    | {
+        status: "fetched";
+        requestedUrl: string;      // as passed in the request
+        url: string;               // normalized URL that was fetched
+        finalUrl: string;          // after redirects
+        redirectChain: string[];
+        markdown: string;          // complete extraction, never truncated or summarized
+        savedPath: string | null;  // null if saving failed; see saveError
+        saveError?: string;
+        bytes: number;
+        lines: number;
+        blockedRequests: { url: string; reason: string }[];
+        cached: boolean;
+      }
+    | { status: "error"; requestedUrl: string; error: string }
+    | { status: "extension"; requestedUrl: string; url: string; extension: string; text: string; isError: boolean }
+  >;
+}
+```
+
+There is one entry per requested URL, in request order. Failed pages don't throw, so check `status`. Only the script's output reaches the model, so a script can fetch many pages and return just the values it needs:
+
+```js
+const urls = ["https://example.com/a", "https://example.com/b" /* ... */];
+const batches = [];
+for (let i = 0; i < urls.length; i += 10) {
+  batches.push(tools.web_fetch({ pages: urls.slice(i, i + 10).map((url) => ({ url })) }));
+}
+const pages = (await Promise.all(batches)).flatMap((result) => result.pages);
+return pages.map((page) =>
+  page.status === "fetched"
+    ? { url: page.finalUrl, title: page.markdown.match(/^# (.+)$/m)?.[1] ?? null }
+    : { url: page.requestedUrl, error: page.status === "error" ? page.error : page.text },
+);
+```
+
+The browser pool opens at most 6 tabs at once, so concurrent batches queue rather than overload Chrome.
+
 ### Saved files
 
 Complete extractions are stored in private directories (`0700`; files `0600`):

@@ -9,7 +9,8 @@ import { Text, Markdown, Container } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { BrowserPool } from "./browser-pool.js";
 import { fetchPage, PAGE_TIMEOUT_MS, type FetchedPage } from "./fetch-page.js";
-import { batchBudget, formatPageResult, type ExtractedPage, type FormatOptions } from "./result.js";
+import type { ExtractedPage } from "./result.js";
+import { buildToolResult, STRUCTURED_RESULT_SCHEMA, type PageOutcome } from "./outcome.js";
 import { cleanupSessionDirectories, DEFAULT_RETENTION_DAYS, EPHEMERAL_RETENTION_DAYS, FetchStore } from "./storage.js";
 
 // Re-export public types for extension authors
@@ -376,58 +377,8 @@ async function extractContent(
 	});
 }
 
-// --- Batch Result Formatting ---
-
-/**
- * Format batch results into a single text content block with per-page headers.
- * Exported for testing.
- */
-export function formatBatchResults(
-	pages: Array<{ url: string }>,
-	results: PromiseSettledResult<any>[],
-) {
-	const total = pages.length;
-
-	// Single page: return the result directly without batch header wrapper
-	if (total === 1) {
-		const settled = results[0];
-		if (settled.status === "rejected") {
-			return {
-				content: [{ type: "text", text: `Error: ${settled.reason?.message || String(settled.reason)}` }],
-				isError: true,
-			};
-		}
-		return settled.value;
-	}
-
-	const sections: string[] = [];
-
-	for (let i = 0; i < total; i++) {
-		const header = `--- [${i + 1}/${total}] ${pages[i].url} ---`;
-		const settled = results[i];
-
-		let body: string;
-		if (settled.status === "rejected") {
-			body = `Error: ${settled.reason?.message || String(settled.reason)}`;
-		} else {
-			const result = settled.value;
-			if (result.isError) {
-				const textContent = result.content?.[0];
-				body = `Error: ${textContent?.type === "text" ? textContent.text : "Unknown error"}`;
-			} else {
-				const textContent = result.content?.[0];
-				body = textContent?.type === "text" ? textContent.text : "(no content)";
-			}
-		}
-
-		sections.push(`${header}\n${body}`);
-	}
-
-	return {
-		content: [{ type: "text", text: sections.join("\n\n") }],
-	};
-}
-
+// Exported for tests and existing imports.
+export { formatBatchResults } from "./outcome.js";
 
 // --- Batch Status Rendering ---
 
@@ -545,7 +496,9 @@ export default function (pi: ExtensionAPI) {
 		store = null;
 	});
 
-	// Register the web_fetch tool
+	// Register the web_fetch tool.
+	// `outputSchema` and `structuredContent` are supported by current Pi (codemode scripts receive the
+	// structured value) but missing from older type definitions. Older Pi ignores them.
 	pi.registerTool({
 		name: "web_fetch",
 		label: "Web Fetch",
@@ -559,6 +512,7 @@ export default function (pi: ExtensionAPI) {
 			"Output:",
 			"- Each result starts with source metadata: final URL, requested URL and redirects when they differ, and the path of the saved Markdown file.",
 			"- The complete extraction is always saved to that file. When it is too large to return inline, the result is a clearly marked PREVIEW ONLY; use read or grep on the saved file for the rest.",
+			"- From codemode, the call resolves to structured data, `{ pages: [...] }`, with one entry per requested URL in request order. Each entry has `status` (\"fetched\", \"error\" or \"extension\") and `requestedUrl`. Fetched entries include `finalUrl`, `redirectChain`, the complete `markdown` (never truncated), `savedPath`, `bytes`, `lines`, `blockedRequests` and `cached`. Errors include `error`. Failed pages do not throw, so check `status`.",
 			"",
 			"Behavior notes:",
 			"- URLs must include the scheme (e.g. https://). Plain HTTP is upgraded to HTTPS.",
@@ -577,6 +531,12 @@ export default function (pi: ExtensionAPI) {
 				),
 			),
 		}),
+		...({
+			outputSchema: STRUCTURED_RESULT_SCHEMA,
+			promptGuidelines: [
+				"Use web_fetch from codemode to extract small facts from many pages: batch up to 10 URLs per call, read each entry's complete `markdown`, and return only the extracted values.",
+			],
+		} as {}),
 
 		async execute(_toolCallId, params, signal, onUpdate) {
 			// --- Parameter validation ---
@@ -676,17 +636,13 @@ export default function (pi: ExtensionAPI) {
 	 */
 	async function processSingleUrl(
 		rawUrl: string,
-		format: FormatOptions,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
-	) {
+	): Promise<PageOutcome> {
 		// 1. Validate and normalize URL
 		const urlResult = validateAndNormalizeUrl(rawUrl);
 		if (urlResult.url === undefined) {
-			return {
-				content: [{ type: "text", text: urlResult.error }],
-				isError: true,
-			};
+			return { status: "error", error: urlResult.error };
 		}
 		const url = urlResult.url;
 
@@ -697,14 +653,14 @@ export default function (pi: ExtensionAPI) {
 		// 2. Check cache (before hooks, since beforeFetch may short-circuit)
 		const cached = getCached(url);
 		if (cached) {
-			return { content: [{ type: "text", text: formatPageResult(cached, format) }] };
+			return { status: "fetched", page: cached, cached: true };
 		}
 
 		// 3. beforeFetch hook — can short-circuit entire pipeline
 		if (matchedExtension?.beforeFetch) {
 			const hookResult = await matchedExtension.beforeFetch(hookCtx);
 			if (hookResult) {
-				return hookResult;
+				return { status: "extension", url, extension: matchedExtension.name, result: hookResult };
 			}
 		}
 
@@ -721,7 +677,7 @@ export default function (pi: ExtensionAPI) {
 			if (hookResult) {
 				if ("content" in hookResult && Array.isArray(hookResult.content)) {
 					// HookResult — short-circuit
-					return hookResult as HookResult;
+					return { status: "extension", url, extension: matchedExtension.name, result: hookResult as HookResult };
 				}
 				if ("html" in hookResult && typeof (hookResult as any).html === "string") {
 					// HTML replacement
@@ -745,7 +701,7 @@ export default function (pi: ExtensionAPI) {
 					markdown = hookResult;
 				} else if ("content" in hookResult && Array.isArray(hookResult.content)) {
 					// HookResult — short-circuit
-					return hookResult as HookResult;
+					return { status: "extension", url, extension: matchedExtension.name, result: hookResult as HookResult };
 				}
 			}
 		}
@@ -772,7 +728,7 @@ export default function (pi: ExtensionAPI) {
 		if (page.savedPath) setCache(url, page);
 
 		// 10. Return extracted content
-		return { content: [{ type: "text", text: formatPageResult(page, format) }] };
+		return { status: "fetched", page, cached: false };
 	}
 
 	// --- Batch Execution ---
@@ -787,8 +743,6 @@ export default function (pi: ExtensionAPI) {
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
 	) {
-		const format: FormatOptions = pages.length === 1 ? {} : batchBudget(pages.length);
-
 		// Track per-page status for UI
 		const pageStates: BatchPageState[] = pages.map((p) => ({
 			url: p.url,
@@ -820,27 +774,27 @@ export default function (pi: ExtensionAPI) {
 				emitBatchUpdate();
 			};
 
-			const result = await processSingleUrl(page.url, format, signal, pageOnUpdate);
+			const outcome = await processSingleUrl(page.url, signal, pageOnUpdate);
 
-			// Mark done or error based on result
-			if (result.isError) {
+			// Mark done or error based on outcome
+			if (outcome.status === "error") {
 				pageStates[i].status = "error";
-				const errText = result.content?.[0];
-				if (errText?.type === "text") {
-					pageStates[i].error = errText.text;
-				}
+				pageStates[i].error = outcome.error;
+			} else if (outcome.status === "extension" && outcome.result.isError) {
+				pageStates[i].status = "error";
 			} else {
 				pageStates[i].status = "done";
 			}
 			emitBatchUpdate();
 
-			return result;
+			return outcome;
 		});
 
-		const results = await Promise.allSettled(promises);
+		const outcomes = await Promise.allSettled(promises);
 
-		// Format results into a single text block
-		return formatBatchResults(pages, results);
+		// Model-facing text plus structured content for programmatic callers
+		const result = buildToolResult(pages, outcomes);
+		return { ...result, details: undefined };
 	}
 	// --- Pipeline Stage Functions ---
 
@@ -852,18 +806,12 @@ export default function (pi: ExtensionAPI) {
 		url: string,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
-	): Promise<{ done: true; result: any } | { done: false; page: FetchedPage }> {
+	): Promise<{ done: true; result: PageOutcome } | { done: false; page: FetchedPage }> {
 		onUpdate?.({ content: [{ type: "text", text: `Fetching ${url}...` }], details: undefined });
 
 		const fetchResult = await fetchPage(browserPool, url, { signal, timeoutMs: PAGE_TIMEOUT_MS });
 		if (!fetchResult.ok) {
-			return {
-				done: true,
-				result: {
-					content: [{ type: "text", text: fetchResult.error }],
-					isError: true,
-				},
-			};
+			return { done: true, result: { status: "error", error: fetchResult.error } };
 		}
 
 		return { done: false, page: fetchResult.page };
@@ -877,18 +825,12 @@ export default function (pi: ExtensionAPI) {
 		html: string,
 		signal?: AbortSignal,
 		onUpdate?: Parameters<Parameters<typeof pi.registerTool>[0]["execute"]>[3],
-	): Promise<{ done: true; result: any } | { done: false; markdown: string }> {
+	): Promise<{ done: true; result: PageOutcome } | { done: false; markdown: string }> {
 		onUpdate?.({ content: [{ type: "text", text: "Extracting content..." }], details: undefined });
 
 		const extractResult = await withTimeout(extractContent(html, signal), EXTRACT_TIMEOUT_MS, "Content extraction", signal).catch((err): { ok: false; error: string } => ({ ok: false, error: err.message }));
 		if (!extractResult.ok) {
-			return {
-				done: true,
-				result: {
-					content: [{ type: "text", text: (extractResult as { ok: false; error: string }).error }],
-					isError: true,
-				},
-			};
+			return { done: true, result: { status: "error", error: (extractResult as { ok: false; error: string }).error } };
 		}
 
 		return { done: false, markdown: extractResult.markdown };

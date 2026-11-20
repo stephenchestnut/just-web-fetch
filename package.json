@@ -28,6 +28,7 @@
     "browser-path.ts",
     "fetch-page.ts",
     "network-policy.ts",
+    "outcome.ts",
     "result.ts",
     "storage.ts",
     "README.md",
