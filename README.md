@@ -38,6 +38,7 @@ It does **just** that: no LLM summarization, no question answering, and no site-
   3. [pipx](https://pipx.pypa.io/)
   4. [pip-run](https://github.com/jaraco/pip-run)
 - Node.js 18+
+- Google Chrome, Chromium, Microsoft Edge, or Brave (or Puppeteer's downloaded browser)
 
 ## Installation
 
@@ -58,7 +59,15 @@ npm install
 pi -e .
 ```
 
-> **Note:** `npm install` downloads Puppeteer's bundled Chromium (~300MB). To use an existing Chrome or Chromium instead, set `PUPPETEER_SKIP_DOWNLOAD=1` during installation and `PUPPETEER_EXECUTABLE_PATH` when running Pi.
+### Browser
+
+just-web-fetch uses the first Chrome-compatible browser it finds:
+
+1. `PUPPETEER_EXECUTABLE_PATH`, if set (an invalid path is reported as an error)
+2. Puppeteer's downloaded browser, if present
+3. An installed Google Chrome, Chromium, Microsoft Edge, or Brave in a standard location
+
+Puppeteer normally downloads its own Chromium (~300MB) in an install script. Many npm configurations block install scripts, and that's fine as long as a browser is installed. To use Puppeteer's browser anyway, run `npx puppeteer browsers install chrome` in the package directory.
 
 > **Note:** The first time `web_fetch` runs, `uvx` downloads the trafilatura package (~10MB). Subsequent runs use the cached environment.
 
@@ -200,6 +209,7 @@ web_fetch(url | pages)
   ├─ URL validation & normalization (http→https, scheme check)
   ├─ Cache check (15-min TTL) → same result and saved file
   ├─ Extension: beforeFetch hook
+  ├─ Network policy check of the requested URL (before starting a browser)
   ├─ Browser pool → Puppeteer page (networkidle2, 10s timeout)
   │    └─ Every request checked by the network policy; redirects followed and recorded
   ├─ Extension: afterFetch hook

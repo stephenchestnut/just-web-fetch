@@ -139,13 +139,14 @@ describe("fetchPage", () => {
 		expect(result.page.redirectChain).toEqual(["https://public.example/"]);
 	});
 
-	it("blocks the initial navigation when it is private", async () => {
-		const { page } = fakePage([{ url: "https://private.example/", navigation: true }], "about:blank");
-		const pool = poolFor(page);
+	it("blocks a private requested URL before acquiring a browser tab", async () => {
+		const pool: PagePool = {
+			acquire: vi.fn().mockRejectedValue(new Error("Could not find Chrome")),
+			release: vi.fn(),
+		};
 		const result = await fetchPage(pool, "https://private.example/", { policy });
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.error).toContain("Blocked navigation to https://private.example/");
-		expect(pool.release).toHaveBeenCalledWith(page);
+		expect(result).toEqual({ ok: false, error: "Blocked navigation to https://private.example/: private address." });
+		expect(pool.acquire).not.toHaveBeenCalled();
 	});
 
 	it("installs a script disabling network APIs that bypass interception", async () => {

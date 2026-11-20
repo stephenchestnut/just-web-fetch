@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { BrowserPool } from "./browser-pool.js";
 
+// Pretend a browser is installed, so tests do not depend on the machine.
+vi.mock("./browser-path.js", () => ({
+	findBrowserExecutable: () => ({ ok: true, path: "/fake/chrome", source: "system" }),
+}));
+
 // We mock puppeteer so tests run fast without a real browser
 vi.mock("puppeteer", () => {
 	const mockPage = () => ({
@@ -23,6 +28,7 @@ vi.mock("puppeteer", () => {
 	return {
 		default: {
 			launch: vi.fn().mockImplementation(async () => mockBrowser()),
+			executablePath: vi.fn().mockReturnValue("/fake/puppeteer-chrome"),
 		},
 	};
 });

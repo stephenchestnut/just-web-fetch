@@ -80,6 +80,15 @@ export async function fetchPage(pool: PagePool, url: string, options: FetchPageO
 	let blockedNavigation: BlockedRequest | null = null;
 	let page: Page | null = null;
 
+	// Check the requested URL before starting a browser, so blocked URLs fail
+	// with the policy reason regardless of browser availability.
+	const initial = await policy.check(url, { mainFrameNavigation: true }).catch(
+		(err: any): PolicyDecision => ({ allowed: false, reason: `policy check failed: ${err?.message || String(err)}` }),
+	);
+	if (!initial.allowed) {
+		return { ok: false, error: blockedNavigationError({ url, reason: initial.reason }, []) };
+	}
+
 	try {
 		if (signal?.aborted) return { ok: false, error: "Aborted" };
 		page = await pool.acquire(signal);

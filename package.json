@@ -25,6 +25,7 @@
     "types.ts",
     "registry.ts",
     "browser-pool.ts",
+    "browser-path.ts",
     "fetch-page.ts",
     "network-policy.ts",
     "result.ts",
