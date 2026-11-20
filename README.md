@@ -2,45 +2,41 @@
 
 > A fork of [`georgebashi/pi-web-fetch`](https://github.com/georgebashi/pi-web-fetch) by George Bashi.
 
-A [pi](https://github.com/badlogic/pi-mono) extension that gives your agent a proper web browser. Fetches pages via headless Chrome, extracts clean content via [trafilatura](https://trafilatura.readthedocs.io/), and optionally distills it with an LLM.
+A [pi](https://github.com/badlogic/pi-mono) extension that fetches web pages in headless Chrome and extracts their main content as Markdown with [trafilatura](https://trafilatura.readthedocs.io/).
 
-## Why not use Claude Code's built-in WebFetch?
+It does **just** that: no LLM summarization, no question answering, and no site-specific redirects. The agent receives source text and decides what to do with it.
 
-Claude Code's WebFetch uses Turndown to convert HTML to markdown — a simple regex-based converter that can't handle JavaScript-rendered pages, doesn't strip boilerplate well, and has no extensibility. pi-web-fetch improves on this in several ways:
+## Differences from pi-web-fetch
 
-| | Claude Code WebFetch | pi-web-fetch |
+| | pi-web-fetch | just-web-fetch |
 |---|---|---|
-| **Rendering** | Static HTTP fetch | Headless Chrome (handles SPAs, JS-rendered content) |
-| **Extraction** | Turndown (regex HTML→md) | [trafilatura](https://trafilatura.readthedocs.io/) (ML-based boilerplate removal) |
-| **Raw content** | Never — prompt is mandatory | Optional — omit prompt to get full markdown |
-| **Batch fetching** | One URL at a time | Up to 10 URLs concurrently with per-URL progress |
-| **Concurrency** | Sequential | Browser pool with 6 parallel tabs |
-| **Extensibility** | None | Hook system for site-specific handling |
-| **Smart redirects** | Generic | Context-aware (e.g. GitHub URLs → `gh` CLI suggestions) |
+| **LLM processing** | Optional prompt; pages over ~50KB summarized automatically | None |
+| **Large pages** | Summary | Clearly marked preview; complete Markdown saved to a file |
+| **Saved content** | In-memory cache only | Per-session Markdown files that survive `pi --session <id>` |
+| **Redirects** | Cross-host redirects stop and ask for a second call | Followed and reported; HTTPS → HTTP rejected |
+| **Local/private addresses** | Not blocked | Blocked for every browser request |
+| **GitHub / Google Docs** | Redirected to `gh` / Workspace tools | Fetched like any other page |
 
 ## Features
 
-- **`web_fetch` tool** — registered in pi's tool system, callable by the LLM
-- **Headless Chrome** via puppeteer — handles JavaScript-rendered pages, SPAs, pages behind cookie banners
-- **Content extraction** — strips boilerplate (nav, ads, footers) using trafilatura's ML-based extraction, outputs clean markdown
-- **LLM processing** — optionally distills page content to answer a specific question via a pi sub-agent
-- **Batch fetching** — fetch up to 10 pages concurrently in a single tool call with per-URL status in the UI
-- **Browser pool** — reuses a single Chrome instance with up to 6 parallel tabs, avoiding repeated browser startup overhead
-- **Smart large-page handling** — when content exceeds ~50KB and no prompt is given, automatically generates a structured summary
-- **15-minute cache** — avoids redundant fetches; enables summarize-then-drill-down workflows
-- **Cross-host redirect detection** — reported to the LLM for explicit follow-up rather than silently following
-- **HTTP→HTTPS auto-upgrade**
-- **Extension hooks** — customize fetch behavior for specific sites (redirect, replace HTML, transform markdown, override summarization)
-- **Built-in site handlers** — GitHub URLs redirect to `gh` CLI, Google Docs redirect to workspace tools
+- **`web_fetch` tool** — fetch one URL or up to 10 concurrently
+- **Headless Chrome** via Puppeteer — handles JavaScript-rendered pages
+- **Content extraction** — trafilatura removes navigation and boilerplate and outputs Markdown
+- **Complete content preserved** — every extraction is saved; large pages return a preview plus the file path
+- **Browser pool** — one Chrome instance with up to 6 parallel tabs
+- **15-minute cache** — repeated fetches return the same saved result without reloading the page
+- **Safe redirects** — redirects are followed and the full chain is reported
+- **Private-network guard** — blocks localhost, private networks, link-local and cloud metadata addresses, and other special-purpose ranges
+- **Extension hooks** — customize fetching for specific sites
 
 ## Prerequisites
 
 - [pi](https://github.com/badlogic/pi-mono) coding agent
 - A Python tool runner for trafilatura (auto-detected in priority order):
   1. [uv](https://docs.astral.sh/uv/) (`uvx`) — fastest, recommended
-  2. `uv run` — fallback if `uvx` alias is missing
-  3. [pipx](https://pipx.pypa.io/) — widely available on Debian/Ubuntu
-  4. [pip-run](https://github.com/jaraco/pip-run) — niche fallback
+  2. `uv run` — fallback if the `uvx` alias is missing
+  3. [pipx](https://pipx.pypa.io/)
+  4. [pip-run](https://github.com/jaraco/pip-run)
 - Node.js 18+
 
 ## Installation
@@ -68,25 +64,15 @@ pi -e .
 
 ## Usage
 
-The extension registers a `web_fetch` tool. The LLM will use it automatically when it needs to fetch web content.
+The extension registers a `web_fetch` tool. The agent uses it when it needs web content.
 
-### Single URL
+> Fetch https://docs.example.com/api
 
-**With a prompt (recommended):**
-> Fetch https://docs.example.com/api and tell me what authentication methods are supported.
-
-**Without a prompt (full content):**
-> Fetch the content of https://example.com/changelog
-
-### Batch fetching
-
-Fetch multiple pages concurrently by asking for several URLs at once:
-> Read these three pages and compare their approaches to error handling:
+> Read these pages and compare their approaches to error handling:
 > - https://docs.python.org/3/tutorial/errors.html
 > - https://go.dev/blog/error-handling-and-go
-> - https://doc.rust-lang.org/book/ch09-00-error-handling.html
 
-The agent will use the `pages` parameter to fetch all URLs in parallel (up to 10 per call). The UI shows live per-URL progress:
+Batch requests use the `pages` parameter (up to 10 URLs). The UI shows per-URL progress:
 
 ```
 ● docs.python.org/3/tutorial/errors.html
@@ -94,23 +80,74 @@ The agent will use the `pages` parameter to fetch all URLs in parallel (up to 10
 ◑ doc.rust-lang.org/book/ch09-00-error-... · extracting
 ```
 
-Each URL independently transitions through: pending → fetching → extracting → summarizing → done/error. The browser pool manages concurrency automatically (6 tabs max).
+Each URL independently moves through pending → fetching → extracting → done/error.
+
+### Results
+
+Each result starts with source metadata:
+
+```
+Source: https://docs.python.org/3/builtins/stdtypes.html
+Requested: https://docs.python.org/3/library/stdtypes.html
+Redirects: https://docs.python.org/3/library/stdtypes.html → https://docs.python.org/3/builtins/stdtypes.html
+Saved: ~/.pi/agent/just-web-fetch/sessions/<session-id>/2026-11-20T06-33-13Z-docs.python.org-35b1682b.md (180.7KB, 3571 lines)
+Content: PREVIEW ONLY — first 96 of 3571 lines (4.0KB of 180.7KB). Complete extraction saved to: ...
+```
+
+- **Small pages** are returned in full (`Content: complete`).
+- **Large pages** return a clearly marked preview. The complete Markdown is in the saved file; use `read` or `grep` on it.
+- In batch mode, the inline output limit is shared across pages, and every page has its own saved file.
+- Blocked subresource requests, if any, are listed.
+
+### Saved files
+
+Complete extractions are stored in private directories (`0700`; files `0600`):
+
+```
+<agent-dir>/just-web-fetch/sessions/<session-id>/<timestamp>-<host>-<hash>.md
+```
+
+`<agent-dir>` is `~/.pi/agent` unless `PI_CODING_AGENT_DIR` is set. Each file starts with YAML front matter recording the requested URL, final URL, fetch time, and redirect chain.
+
+| Situation | Behavior |
+|---|---|
+| Quit, then `pi --session <id>` | Files are kept, so paths in the session history still work |
+| `/new`, `/resume`, `/reload` | Files are kept |
+| Forked session | New fetches use the new session's directory; the parent's files remain |
+| `--no-session` | Files go to `<agent-dir>/just-web-fetch/ephemeral/` and are removed when the run ends |
+| Session deleted in Pi | Removed later by age-based cleanup |
+
+On startup, session directories unused for `retentionDays` (default 30) are deleted. Leftover ephemeral directories older than one day are also removed.
+
+### Network policy
+
+- URLs must include a scheme. Plain `http://` is upgraded to `https://`; other schemes are rejected.
+- Redirects are followed automatically, including to other hosts. HTTP redirects, JavaScript navigation, and meta refreshes are all reported.
+- Main-frame navigation must use HTTPS, so HTTPS → HTTP redirects are rejected.
+- Every browser request — the page, redirects, frames, scripts, images, and `fetch`/XHR — is checked before it is sent. Hostnames are resolved, and a request is blocked if **any** resolved address is:
+  - localhost or loopback (`127.0.0.0/8`, `::1`, `*.localhost`)
+  - private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`)
+  - link-local, including cloud metadata (`169.254.0.0/16`, `fe80::/10`)
+  - carrier-grade NAT, multicast, documentation, benchmarking, reserved, or other special-purpose ranges
+  - an IPv4-mapped, IPv4-compatible, or NAT64 IPv6 form of any of these
+- Blocked page navigations fail the fetch. Blocked subresources are aborted and listed in the result.
+- WebSocket, WebTransport, and WebRTC are disabled because Puppeteer cannot intercept them. Service workers are bypassed.
+- There is no allowlist. Use `bash` with `curl` for local services.
+
+**Limitation:** the address check and Chrome's own connection perform separate DNS lookups. A hostile DNS server could return a public address to the check and a private one to Chrome (DNS rebinding). Closing that gap fully requires a filtering proxy or OS-level network controls.
+
+The headless browser uses a fresh profile, so it does not have your normal Chrome cookies or logins.
 
 ## Extensions
 
-pi-web-fetch has a hook system for site-specific fetch behavior. Extensions can intercept any stage of the pipeline: before fetch, after fetch (HTML), after extraction (markdown), or at summarization time.
-
-### Built-in extensions
-
-- **GitHub redirect** — matches `github.com/**`, redirects to `gh` CLI with context-aware suggestions (e.g. `gh issue view 123`)
-- **Google Docs redirect** — matches `docs.google.com/**`, redirects to Google Workspace MCP tools
+Extensions customize fetching for specific URLs. Hooks can short-circuit the pipeline before fetching, replace or short-circuit after fetching (HTML), or replace or short-circuit after extraction (Markdown).
 
 ### Writing extensions
 
-Extensions are TypeScript modules with a factory function default export:
+Extensions are TypeScript or JavaScript modules with a factory function default export:
 
 ```typescript
-import type { WebFetchExtension } from "pi-web-fetch/types";
+import type { WebFetchExtension } from "just-web-fetch/types";
 
 export default function (): WebFetchExtension {
   return {
@@ -118,68 +155,69 @@ export default function (): WebFetchExtension {
     matches: ["example.com/**"],
     async beforeFetch(ctx) {
       // Return a HookResult to short-circuit, or void to continue
-      return ctx.redirect("Use a different tool for this site.");
+      return { content: [{ type: "text", text: "Use a different tool for this site." }] };
     },
     async afterFetch(ctx) {
-      // ctx.html — replace HTML or short-circuit
+      // ctx.html — return { html } to replace it, a HookResult to short-circuit, or void
     },
     async afterExtract(ctx) {
-      // ctx.markdown — replace markdown or short-circuit
-    },
-    async summarize(ctx) {
-      // Override default LLM summarization
+      // ctx.markdown — return a string to replace it, a HookResult to short-circuit, or void
     },
   };
 }
 ```
 
+Results from a short-circuiting hook are returned as-is; they are not saved or cached.
+
 ### Extension sources (in priority order)
 
-1. **Event bus** — other pi extensions can register handlers via `pi.events.emit("web-fetch:register", extension)`
-2. **Local** — TypeScript/JS files in `~/.pi/extensions/web-fetch/` (or configured `extensionsDir`)
-3. **Built-in** — shipped with pi-web-fetch in the `extensions/` directory
+1. **Event bus** — other pi extensions can register handlers with `pi.events.emit("web-fetch:register", extension)`
+2. **Local** — `.ts`/`.js` files in `<agent-dir>/just-web-fetch/extensions/` (or the configured `extensionsDir`)
+
+No extensions are built in.
 
 ## Configuration
 
-Create `~/.pi/agent/web-fetch.json` to override defaults:
+Optionally create `<agent-dir>/just-web-fetch.json`:
 
 ```json
 {
-  "model": "provider/model-id",
-  "thinkingLevel": "medium",
-  "extensionsDir": "~/.pi/extensions/web-fetch"
+  "extensionsDir": "~/my-web-fetch-extensions",
+  "retentionDays": 30
 }
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `model` | Current session model | Model for LLM content processing |
-| `thinkingLevel` | Current session thinking level | Thinking level for the sub-agent |
-| `extensionsDir` | `~/.pi/extensions/web-fetch/` | Directory for local extensions |
-
-Without a config file, the extension uses whatever model and thinking level the current session is using.
+| `extensionsDir` | `<agent-dir>/just-web-fetch/extensions/` | Directory for local extensions |
+| `retentionDays` | `30` | Delete saved session directories unused for this many days; `0` disables cleanup |
 
 ## Architecture
 
 ```
-web_fetch(url, prompt?)
+web_fetch(url | pages)
   │
   ├─ URL validation & normalization (http→https, scheme check)
-  ├─ Cache check (15-min TTL)
+  ├─ Cache check (15-min TTL) → same result and saved file
   ├─ Extension: beforeFetch hook
-  ├─ Browser pool → Puppeteer page (networkidle2, 30s timeout)
-  ├─ Cross-host redirect detection
+  ├─ Browser pool → Puppeteer page (networkidle2, 10s timeout)
+  │    └─ Every request checked by the network policy; redirects followed and recorded
   ├─ Extension: afterFetch hook
-  ├─ trafilatura extraction (HTML → clean markdown)
+  ├─ trafilatura extraction (HTML → Markdown)
   ├─ Extension: afterExtract hook
+  ├─ Save complete Markdown to the session directory
   ├─ Cache store
-  └─ Content processing:
-      ├─ With prompt → pi sub-agent (focused extraction)
-      ├─ Small content, no prompt → return raw markdown
-      └─ Large content, no prompt → pi sub-agent (structured summary)
+  └─ Result: metadata + complete content, or a marked preview
 ```
 
-For batch mode, each URL runs through this pipeline independently with its own browser tab. The browser pool (6 tabs max, 60s idle timeout) provides backpressure.
+In batch mode, each URL runs through this pipeline independently with its own browser tab.
+
+## Development
+
+```bash
+npm install
+npm test
+```
 
 ## License
 
