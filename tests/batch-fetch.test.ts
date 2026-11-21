@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatBatchResults, MAX_BATCH_SIZE } from "./index.js";
+import { formatBatchResults, MAX_BATCH_SIZE } from "../src/index.js";
 
 // --- helpers ---
 

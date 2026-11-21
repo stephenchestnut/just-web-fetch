@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { matchExtension, ExtensionRegistry } from "./registry.js";
-import type { WebFetchExtension } from "./types.js";
+import { matchExtension, ExtensionRegistry } from "../src/registry.js";
+import type { WebFetchExtension } from "../src/types.js";
 
 // --- Test helpers ---
 

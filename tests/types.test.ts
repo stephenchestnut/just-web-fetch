@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { createHookContext } from "./types.js";
-import type { WebFetchExtension, HookResult } from "./types.js";
+import { createHookContext } from "../src/types.js";
+import type { WebFetchExtension, HookResult } from "../src/types.js";
 
 describe("createHookContext", () => {
 	it("creates context with normalized URL", () => {

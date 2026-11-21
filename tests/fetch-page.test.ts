@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fetchPage, type PagePool, type RequestPolicy } from "./fetch-page.js";
+import { fetchPage, type PagePool, type RequestPolicy } from "../src/fetch-page.js";
 
 type Handler = (request: any) => void;
 

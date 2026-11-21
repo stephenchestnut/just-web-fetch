@@ -59,6 +59,8 @@ npm install
 pi -e .
 ```
 
+The extension entry point is `src/index.ts`; run `npm test` to run the tests in `tests/`. The root `index.ts` is a compatibility shim for existing Pi configurations that load that file directly.
+
 ### Browser
 
 just-web-fetch uses the first Chrome-compatible browser it finds:

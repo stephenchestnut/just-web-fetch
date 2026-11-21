@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { batchBudget, formatPageResult, type ExtractedPage } from "./result.js";
+import { batchBudget, formatPageResult, type ExtractedPage } from "../src/result.js";
 
 function page(markdown: string, overrides: Partial<ExtractedPage> = {}): ExtractedPage {
 	return {

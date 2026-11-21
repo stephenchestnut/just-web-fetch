@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { BrowserPool } from "./browser-pool.js";
+import { BrowserPool } from "../src/browser-pool.js";
 
 // Pretend a browser is installed, so tests do not depend on the machine.
 vi.mock("./browser-path.js", () => ({

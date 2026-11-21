@@ -22,25 +22,17 @@
   "license": "MIT",
   "files": [
     "index.ts",
-    "types.ts",
-    "registry.ts",
-    "browser-pool.ts",
-    "browser-path.ts",
-    "fetch-page.ts",
-    "network-policy.ts",
-    "outcome.ts",
-    "result.ts",
-    "storage.ts",
+    "src/",
     "README.md",
     "LICENSE"
   ],
   "exports": {
-    ".": "./index.ts",
-    "./types": "./types.ts"
+    ".": "./src/index.ts",
+    "./types": "./src/types.ts"
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./src/index.ts"
     ]
   },
   "dependencies": {

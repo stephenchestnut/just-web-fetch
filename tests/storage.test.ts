@@ -8,7 +8,7 @@ import {
 	renderSavedPage,
 	savedPageFilename,
 	sessionDirectoryName,
-} from "./storage.js";
+} from "../src/storage.js";
 
 let root: string;
 let sessionsRoot: string;

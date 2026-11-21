@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Value } from "@sinclair/typebox/value";
-import { buildToolResult, outcomeToStructured, STRUCTURED_RESULT_SCHEMA, type PageOutcome } from "./outcome.js";
-import type { ExtractedPage } from "./result.js";
+import { buildToolResult, outcomeToStructured, STRUCTURED_RESULT_SCHEMA, type PageOutcome } from "../src/outcome.js";
+import type { ExtractedPage } from "../src/result.js";
 
 function page(markdown: string, overrides: Partial<ExtractedPage> = {}): ExtractedPage {
 	return {

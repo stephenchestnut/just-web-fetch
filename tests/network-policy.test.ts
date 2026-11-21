@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { isBlockedAddress, NetworkPolicy, type Resolver } from "./network-policy.js";
+import { isBlockedAddress, NetworkPolicy, type Resolver } from "../src/network-policy.js";
 
 const publicResolver: Resolver = async () => [{ address: "93.184.216.34", family: 4 }];
 

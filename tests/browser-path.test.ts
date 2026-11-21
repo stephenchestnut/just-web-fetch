@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findBrowserExecutable, systemBrowserCandidates } from "./browser-path.js";
+import { findBrowserExecutable, systemBrowserCandidates } from "../src/browser-path.js";
 
 const exists = (...paths: string[]) => (path: string) => paths.includes(path);
 const MAC_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
